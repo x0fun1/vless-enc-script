@@ -4,7 +4,7 @@
 
 ## 一条命令部署
 
-在使用 systemd 的 Linux 主机上以 root 执行。脚本安装 Rust 工具链和构建依赖、下载固定源码、检查关键源码 SHA-256、生成配置和客户端链接、构建核心并安装/启动 systemd 服务：
+在使用 systemd 的 Linux 主机上以 root 执行。脚本从 GitHub 下载对应架构的预编译核心，生成配置和客户端链接并安装/启动 systemd 服务；服务器不编译源码：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main/install.sh)
@@ -17,9 +17,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main
   --port 18443 --host YOUR_SERVER_IP --auth x25519 --mode native
 ```
 
-`--port` 默认 `443`；省略 `--host` 时脚本尝试检测公网 IPv4/IPv6。认证可选 `x25519` 或 `mlkem768`，外观可选 `native`、`xorpub` 或 `random`，客户端设置必须相同。安装成功后链接写入 `/root/vless-rust_link.txt`，配置位于 `/usr/local/etc/vless-rust/config.json`。请在云安全组和主机防火墙放行所选 TCP 端口。
+`--port` 默认从 `10000–60000` 随机选择空闲 TCP 端口；省略 `--host` 时自动检测 VPS 公网 IPv4/IPv6。认证可选 `x25519` 或 `mlkem768`，外观可选 `native`、`xorpub` 或 `random`，客户端设置必须相同。安装成功后终端会显示 VLESS+ENC 分享链接；链接也写入 `/root/vless-rust_link.txt`，配置位于 `/usr/local/etc/vless-rust/config.json`。请在云安全组和主机防火墙放行所选 TCP 端口。
 
-脚本适用于 Linux/systemd，缺少基础工具时自动使用 apt 安装依赖；其他发行版需预先提供 `curl`、`sha256sum`、`tar`、C 编译工具和 `pkg-config`。Rust 工具链固定为 `1.100.0`，Cargo 依赖由 `Cargo.lock` 锁定。已有配置会由 Rust 安装器保留；若该服务已有运行实例，更新后仍按原运行状态处理。
+脚本安装少量下载工具，下载 GitHub Actions 已构建的 Linux 二进制并验证 SHA-256；服务器不安装 Rust/Cargo，也不进行编译。首次安装需要访问 GitHub Releases。Rust 构建由仓库 CI 使用固定工具链和 `Cargo.lock` 完成。
 
 ## 服务管理
 

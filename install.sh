@@ -5,10 +5,8 @@ umask 077
 SCRIPT_VERSION="v26.11.22-rust"
 CORE_VERSION="0.1.1"
 CORE_REFERENCE="Xray-core v26.11.9"
-CORE_SOURCE_REF="baea9e87496f8b1d3634ce7332c319a2d80ee5dd"
+CORE_SOURCE_REF="0c794cf6cb5bffa70cf64c76fa7b463df09e5852"
 BUILD_ROOT=/usr/local/lib/vless-rust-build
-CARGO_HOME="$BUILD_ROOT/cargo"
-RUSTUP_HOME="$BUILD_ROOT/rustup"
 WORK_DIR=""
 
 usage() {
@@ -16,7 +14,7 @@ usage() {
 VLESS Encryption Rust installer ${SCRIPT_VERSION}
 
 Usage: sudo bash install.sh [options]
-  --port PORT       Listen port (default: 443)
+  --port PORT       Listen port (default: random from 10000-60000)
   --host HOST       Public IP or hostname (auto-detected if omitted)
   --auth MODE       x25519 or mlkem768 (default: x25519)
   --mode MODE       native, xorpub, or random (default: native)
@@ -29,7 +27,7 @@ EOF
 
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
-port=443 host='' auth=x25519 mode=native
+port='' host='' auth=x25519 mode=native
 while (($#)); do
     case "$1" in
         --port|--host|--auth|--mode)
@@ -45,7 +43,10 @@ while (($#)); do
         *) fail "Unknown option: $1" ;;
     esac
 done
-[[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || fail 'Port must be between 1 and 65535.'
+if [[ -n "$port" ]]; then
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || fail 'Port must be between 1 and 65535.'
+    ((10#$port >= 1 && 10#$port <= 65535)) || fail 'Port must be between 1 and 65535.'
+fi
 [[ "$auth" == x25519 || "$auth" == mlkem768 ]] || fail 'Auth must be x25519 or mlkem768.'
 [[ "$mode" == native || "$mode" == xorpub || "$mode" == random ]] || fail 'Mode must be native, xorpub, or random.'
 if [[ -n "$host" ]]; then
@@ -55,28 +56,18 @@ fi
 [[ "$(id -u)" == 0 ]] || fail 'Run as root: sudo bash install.sh'
 command -v systemctl >/dev/null 2>&1 || fail 'systemd is required.'
 
-for cmd in curl sha256sum tar cc pkg-config; do
+for cmd in curl sha256sum tar ss shuf grep; do
     command -v "$cmd" >/dev/null 2>&1 && continue
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar build-essential pkg-config
+        DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar iproute2 grep
         break
     fi
     fail "Missing required command '$cmd'; install it and rerun."
 done
-for cmd in curl sha256sum tar cc pkg-config; do command -v "$cmd" >/dev/null 2>&1 || fail "Required command '$cmd' is unavailable."; done
-
+for cmd in curl sha256sum tar ss shuf grep; do command -v "$cmd" >/dev/null 2>&1 || fail "Required command '$cmd' is unavailable."; done
 mkdir -p "$BUILD_ROOT"
 chmod 0755 "$BUILD_ROOT"
-export CARGO_HOME RUSTUP_HOME
-if ! command -v rustup >/dev/null 2>&1; then
-    printf 'Installing pinned Rust toolchain manager...\n'
-    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
-fi
-export PATH="$CARGO_HOME/bin:$HOME/.cargo/bin:$PATH"
-command -v rustup >/dev/null 2>&1 || fail 'rustup installation failed.'
-rustup toolchain install 1.100.0 --profile minimal
-rustup default 1.100.0
 
 WORK_DIR=$(mktemp -d "$BUILD_ROOT/deploy.XXXXXX")
 cleanup() {
@@ -112,6 +103,18 @@ for entry in "${CORE_FILES[@]}"; do
     [[ "$actual" == "$expected" ]] || fail "Pinned source checksum mismatch: $file"
 done
 
+if [[ -z "$port" ]]; then
+    for attempt in {1..100}; do
+        candidate=$(shuf -i 10000-60000 -n 1)
+        listeners=$(ss -H -ltn "sport = :$candidate") || fail 'Could not inspect listening TCP ports.'
+        if [[ -z "$listeners" ]]; then port=$candidate; break; fi
+    done
+    [[ -n "$port" ]] || fail 'Could not find a free TCP port in 10000-60000.'
+else
+    listeners=$(ss -H -ltn "sport = :$port") || fail 'Could not inspect listening TCP ports.'
+    [[ -z "$listeners" ]] || fail "TCP port $port is already in use."
+fi
+
 if [[ -z "$host" ]]; then
     host=$(curl --proto '=https' --tlsv1.2 -4fsS --max-time 8 https://api.ipify.org || true)
     if [[ ! "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -121,11 +124,23 @@ if [[ -z "$host" ]]; then
 fi
 [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || fail 'Detected host is invalid.'
 
-printf 'Building vless-rust %s...\n' "$CORE_VERSION"
-cargo build --manifest-path "$ROOT/Cargo.toml" --locked --release
-binary="$ROOT/target/release/vless-rust"
-[[ -x "$binary" ]] || fail 'Rust core build did not produce an executable.'
-[[ "$("$binary" version)" == "vless-rust $CORE_VERSION reference $CORE_REFERENCE" ]] || fail 'Built core version or protocol reference does not match the deployment pin.'
+machine=$(uname -m)
+case "$machine" in
+    x86_64|amd64) asset_arch=x86_64 ;;
+    aarch64|arm64) asset_arch=aarch64 ;;
+    *) fail "Unsupported Linux architecture: $machine" ;;
+esac
+printf 'Downloading prebuilt vless-rust %s for %s...\n' "$CORE_VERSION" "$asset_arch"
+release_url="https://github.com/x0fun1/vless-enc-script/releases/download/vless-rust-v${CORE_VERSION}"
+binary="$WORK_DIR/vless-rust"
+curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+    "$release_url/vless-rust-linux-${asset_arch}" -o "$binary"
+expected=$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+    "$release_url/vless-rust-linux-${asset_arch}.sha256")
+actual=$(sha256sum "$binary" | awk '{print $1}')
+[[ "$expected" =~ ^[0-9a-f]{64}$ && "$actual" == "$expected" ]] || fail 'Prebuilt binary SHA-256 verification failed.'
+chmod 0755 "$binary"
+[[ "$("$binary" version)" == "vless-rust $CORE_VERSION reference $CORE_REFERENCE" ]] || fail 'Downloaded core version or protocol reference does not match the deployment pin.'
 
 config="$WORK_DIR/config.json"
 link=$("$binary" init --config "$config" --host "$host" --port "$port" --auth "$auth" --mode "$mode")
@@ -146,6 +161,13 @@ link_tmp=$(mktemp /root/vless-rust_link.txt.tmp.XXXXXX)
 printf '%s\n' "$link" > "$link_tmp"
 chmod 0600 "$link_tmp"
 mv -Tf "$link_tmp" /root/vless-rust_link.txt
-printf '\nVLESS Encryption Rust core %s is active (PID %s).\n' "$CORE_VERSION" "$pid"
-printf 'Client link: %s\n' "$link"
+uuid=${link#vless://}
+uuid=${uuid%%@*}
+printf '\nVLESS+ENC configuration installed and active.\n'
+printf 'Server IP/host: %s\n' "$host"
+printf 'Port: %s/TCP\n' "$port"
+printf 'UUID: %s\n' "$uuid"
+printf 'Authentication: %s\n' "$auth"
+printf 'Traffic mode: %s\n' "$mode"
+printf 'Client configuration (VLESS + ENC):\n%s\n' "$link"
 printf 'Service logs: journalctl -u vless-rust -f --no-pager\n'

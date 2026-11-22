@@ -48,7 +48,7 @@ cargo build --release --locked
 bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main/install.sh)
 ```
 
-可用 `--port`、`--host`、`--auth` 和 `--mode` 指定监听端口、公网地址、认证模式与流量外观；省略 `--host` 时尝试自动检测公网地址。脚本下载固定源码并校验关键文件、安装 Rust 1.100.0、构建核心、生成配置和客户端链接，再安装并启动 systemd 服务。链接保存在 `/root/vless-rust_link.txt`。本地仓库也可用 `sudo bash rust-core/install.sh --config FILE` 安装已有配置，或加 `--binary FILE` 安装预构建 Linux 二进制。
+可用 `--port`、`--host`、`--auth` 和 `--mode` 指定监听端口、公网地址、认证模式与流量外观；未指定端口时随机选择 `10000–60000` 内的空闲 TCP 端口，省略 `--host` 时自动检测公网地址。脚本下载并校验 GitHub Actions 发布的预编译二进制，再生成配置和客户端链接并安装、启动 systemd 服务；服务器不需要 Rust/Cargo，也不编译源码。成功后终端显示 VLESS+ENC 分享链接，并写入 `/root/vless-rust_link.txt`。本地仓库也可用 `sudo bash rust-core/install.sh --config FILE` 安装已有配置，或加 `--binary FILE` 安装预构建 Linux 二进制。
 
 安装目标：`/usr/local/bin/vless-rust`。
 - 配置：`/usr/local/etc/vless-rust/config.json`，`root:vless-rust`、`0640`。

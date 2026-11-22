@@ -1,0 +1,72 @@
+name: Build Rust core release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-core/**"
+      - ".github/workflows/rust-core-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.100.0
+      - name: Build release binary
+        working-directory: rust-core
+        run: cargo build --locked --release
+      - name: Package binary and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 0755 rust-core/target/release/vless-rust "dist/vless-rust-linux-${{ matrix.arch }}"
+          sha256sum "dist/vless-rust-linux-${{ matrix.arch }}" | awk '{print $1}' > "dist/vless-rust-linux-${{ matrix.arch }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vless-rust-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: rust-core/Cargo.toml
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vless-rust-*
+          path: dist
+          merge-multiple: true
+      - name: Read package version
+        id: package
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' rust-core/Cargo.toml | head -n 1)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vless-rust-v${{ steps.package.outputs.version }}
+          name: vless-rust ${{ steps.package.outputs.version }}
+          prerelease: false
+          make_latest: false
+          overwrite_files: true
+          files: dist/*

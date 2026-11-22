@@ -54,6 +54,15 @@ class DeploymentInstallerTests(unittest.TestCase):
         self.assertRegex(cargo, r'(?m)^version = "0\.1\.1"$')
         self.assertIn("vless-rust 0.1.1 reference Xray-core v26.11.9", install)
         self.assertIn('CORE_VERSION="0.1.1"', root_installer)
+        self.assertIn('releases/download/vless-rust-v${CORE_VERSION}', root_installer)
+        self.assertIn('vless-rust-linux-${asset_arch}.sha256', root_installer)
+        self.assertNotIn("cargo build", root_installer)
+        self.assertIn("shuf -i 10000-60000", root_installer)
+        self.assertIn("Client configuration (VLESS + ENC)", root_installer)
+        workflow = (ROOT / ".github/workflows/rust-core-release.yml").read_text(encoding="utf-8")
+        self.assertIn("arch: x86_64", workflow)
+        self.assertIn("arch: aarch64", workflow)
+        self.assertIn("cargo build --locked --release", workflow)
 
     def test_install_scripts_parse(self):
         result = subprocess.run(
