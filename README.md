@@ -9,7 +9,7 @@
 需要 **root、Bash、curl、systemd**，依赖安装支持 apt、dnf 或 yum；在交互终端运行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vless-encryption/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main/install.sh)
 ```
 
 选择 `1` 安装，再选择模式：
@@ -41,7 +41,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vless-encryption/ma
 不带 `--sni` 安装 VLESS Encryption，添加 `--sni www.nvidia.com`、`--sni www.amd.com` 或 `--sni www.intel.com` 则安装 REALITY 模式；均覆盖已有配置，不询问重装确认：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vless-encryption/main/install.sh) install --port 12345
+bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main/install.sh) install --port 12345
 ```
 
 - `--port` 默认 `443`，`--uuid` 不填自动生成。
