@@ -24,6 +24,7 @@ def extract(n):
 class Tests(unittest.TestCase):
  def run_case(self,names,body):
   with tempfile.TemporaryDirectory(prefix='encryption-test-') as d:
+   root=subprocess.run(['cygpath','-u',d],check=True,capture_output=True,text=True).stdout.strip() if os.name=='nt' else d
    setup='''set -euo pipefail
 RUN="$PWD"; XRAY_BIN="$RUN/core"; XRAY_CONFIG="$RUN/config.json"; ENCRYPTION_INFO="$RUN/encryption.info"; REALITY_INFO="$RUN/reality.info"; SUBSCRIPTION_INFO="$RUN/link"; ROLLBACK_DIR=""; INSTALL_ROLLBACK_DIR=""
 AUTH_MODE=x25519; TRAFFIC_MODE=native
@@ -60,7 +61,7 @@ printf '00000000-0000-4000-8000-000000000000\\n' > "$RUN/proc/sys/kernel/random/
    parts=[]
    for n in names:
     text=extract(n)
-    if n != 'normalize_official_writes': text=relocate(text,d)
+    if n != 'normalize_official_writes': text=relocate(text,root)
     parts.append(text)
    text='\n'.join(parts)
    # Older cases predate UnitFileState. Their explicit systemctl mocks model
@@ -68,7 +69,7 @@ printf '00000000-0000-4000-8000-000000000000\\n' > "$RUN/proc/sys/kernel/random/
    if 'UnitFileState' not in body:
     body=body.replace('systemctl() {','systemctl() { if [[ "$*" = "show -p UnitFileState xray" ]]; then printf "UnitFileState=disabled\\n"; return 0; fi;')
    f=pathlib.Path(d)/'fixture.sh';f.write_text(setup+text+'\n'+body)
-   o=subprocess.run(['bash',str(f)],cwd=d,text=True,capture_output=True,env={**os.environ,'TMPDIR':d},timeout=120 if 'run_official_installer' in names else 15)
+   o=subprocess.run(['bash',str(f)],cwd=d,text=True,capture_output=True,env={**os.environ,'TMPDIR':root,'PWD':root},timeout=120 if 'run_official_installer' in names or ('XRAY_TEST_BINARY' in body and os.environ.get('XRAY_TEST_BINARY')) else 15)
    self.assertEqual(o.returncode,0,o.stdout+o.stderr);return o
  def test_mainpid_without_modern_value_flag(self):
   self.run_case(['xray_main_pid'],r'''
@@ -246,16 +247,19 @@ cmp original "$XRAY_CONFIG"
 [[ -z "$ROLLBACK_DIR" ]]
 ''')
  def test_current_schema_and_legacy_migration(self):
-  self.run_case(['write_config'],r'''
+  self.run_case(['write_config','clear_rollback'],r'''
 validate_encryption_token() { :; }; validate_reality_key() { :; }; valid_sni() { :; }; valid_short_id() { :; }
 service_account() { printf '%s:%s\n' "$(id -u)" "$(id -g)"; }
 printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
-printf '%s' '{"inbounds":[{"settings":{"clients":[{"id":"old"},{"id":"extra"}]},"streamSettings":{"network":"tcp","tcpSettings":{"header":{"type":"none"}},"security":"reality","realitySettings":{"dest":"www.amd.com:443","serverNames":["www.amd.com"],"shortIds":["aa","bb"]}}}],"dns":{"servers":["1.1.1.1"]}}' > "$XRAY_CONFIG"
+printf '%s' '{"inbounds":[{"settings":{"clients":[{"id":"old"},{"id":"extra"}],"flow":"xtls-rprx-vision"},"streamSettings":{"network":"tcp","tcpSettings":{"header":{"type":"none"}},"security":"reality","realitySettings":{"dest":"www.amd.com:443","serverNames":["www.amd.com"],"shortIds":["aa","bb"]}}}],"dns":{"servers":["1.1.1.1"]}}' > "$XRAY_CONFIG"
 jq '.outbounds=[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6",targetStrategy:"",redirect:"127.0.0.1:80"}}]' "$XRAY_CONFIG" > extra; mv extra "$XRAY_CONFIG"
 write_config 443 uuid dec enc reality private public www.nvidia.com 20220701 true
 jq -e '.outbounds[0] | .streamSettings.sockopt.domainStrategy=="UseIPv4v6" and .settings.redirect=="127.0.0.1:80" and (.settings|has("domainStrategy")|not) and (.settings|has("targetStrategy")|not)' "$XRAY_CONFIG" >/dev/null
-jq -e '.inbounds[0] | (.settings.users[0].id=="uuid" and .settings.users[1].id=="extra" and (.settings|has("clients")|not) and .streamSettings.method=="raw" and (.streamSettings|has("network")|not) and .streamSettings.rawSettings.header.type=="none" and .streamSettings.realitySettings.target=="www.nvidia.com:443" and (.streamSettings.realitySettings|has("dest")|not))' "$XRAY_CONFIG" >/dev/null
+jq -e '.inbounds[0] | (.settings.users[0].id=="uuid" and .settings.users[0].flow=="xtls-rprx-vision" and .settings.users[1].id=="extra" and (.settings|has("clients")|not) and .streamSettings.method=="raw" and (.streamSettings|has("network")|not) and .streamSettings.rawSettings.header.type=="none" and .streamSettings.realitySettings.target=="www.nvidia.com:443" and (.streamSettings.realitySettings|has("dest")|not))' "$XRAY_CONFIG" >/dev/null
 jq -e '.dns.servers==["1.1.1.1"]' "$XRAY_CONFIG" >/dev/null
+clear_rollback
+write_config 443 uuid dec enc encryption '' '' '' '' true
+jq -e '.inbounds[0] | .settings.users[0].id=="uuid" and (.settings.users[0]|has("flow")|not) and (.settings|has("flow")|not) and .settings.users[1].flow=="xtls-rprx-vision" and .streamSettings.security=="none" and (.streamSettings|has("realitySettings")|not)' "$XRAY_CONFIG" >/dev/null
 ''')
  def test_subscription_reads_current_and_legacy_users(self):
   binary=os.environ.get('XRAY_TEST_BINARY')
@@ -266,10 +270,13 @@ pair=$(generate_encryption_pair); enc=${pair#*|}
 printf '%s\n' "$enc" > "$ENCRYPTION_INFO"
 public_ip() { printf '[2001:db8::7]'; }
 for field in users clients; do
- jq -n --arg field "$field" '{inbounds:[{protocol:"vless",port:443,settings:{($field):[{id:"00000000-0000-4000-8000-000000000000",flow:"xtls-rprx-vision"}],decryption:"old"}}]}' > "$XRAY_CONFIG"
- show_subscription || exit 81
- [[ $(cat "$SUBSCRIPTION_INFO") = 'vless://00000000-0000-4000-8000-000000000000@[2001:db8::7]:443?'* ]]
- [[ $(cat "$SUBSCRIPTION_INFO") = *'type=tcp'* ]]
+ for flow in none vision; do
+  jq -n --arg field "$field" --arg flow "$flow" '{inbounds:[{protocol:"vless",port:443,settings:{($field):[(if $flow=="vision" then {id:"00000000-0000-4000-8000-000000000000",flow:"xtls-rprx-vision"} else {id:"00000000-0000-4000-8000-000000000000"} end)],decryption:"old"}}]}' > "$XRAY_CONFIG"
+  show_subscription || exit 81
+  [[ $(cat "$SUBSCRIPTION_INFO") = 'vless://00000000-0000-4000-8000-000000000000@[2001:db8::7]:443?'* ]]
+  [[ $(cat "$SUBSCRIPTION_INFO") = *'type=tcp'* ]]
+  if [[ "$flow" = vision ]]; then [[ $(cat "$SUBSCRIPTION_INFO") = *'flow=xtls-rprx-vision'* ]]; else [[ $(cat "$SUBSCRIPTION_INFO") != *'flow='* ]]; fi
+ done
 done
 ''')
  def test_existing_mldsa_seed_is_exported(self):
@@ -317,6 +324,7 @@ for AUTH_MODE in x25519 mlkem768; do
   preserve=false
   for mode in encryption reality encryption; do
    write_config 18443 00000000-0000-4000-8000-000000000000 "$dec" "$enc" "$mode" "$private" "$public" www.nvidia.com 20220701 "$preserve"
+   if [[ "$mode" = reality ]]; then jq -e '.inbounds[0].settings.users[0].flow=="xtls-rprx-vision"' "$XRAY_CONFIG" >/dev/null; else jq -e '(.inbounds[0].settings.users[0]|has("flow")|not)' "$XRAY_CONFIG" >/dev/null; fi
    clear_rollback
    jq '.inbounds[0].tag="custom" | .dns={servers:["1.1.1.1"]}' "$XRAY_CONFIG" > "$RUN/extra.json"
    mv "$RUN/extra.json" "$XRAY_CONFIG"
@@ -773,7 +781,7 @@ printf enc > "$ENCRYPTION_INFO"
 validate_encryption_token() { :; }; public_ip() { printf 192.0.2.1; }
 show_subscription || exit 82
 cp "$SUBSCRIPTION_INFO" original
-for change in '.inbounds[0].streamSettings.security="tls"' '.inbounds[0].streamSettings.method="ws"' '.inbounds[0].settings.users[0].flow=""' '.inbounds[0].protocol="trojan"' '., .' ; do
+for change in '.inbounds[0].streamSettings.security="tls"' '.inbounds[0].streamSettings.method="ws"' '.inbounds[0].settings.users[0].flow="unsupported"' '.inbounds[0].protocol="trojan"' '., .' ; do
  jq "$change" valid.json > "$XRAY_CONFIG"
  if show_subscription; then exit 81; fi
  cmp original "$SUBSCRIPTION_INFO"
@@ -1187,7 +1195,7 @@ done
 AUTH_MODE=x25519
 main install --port 65535 --uuid 00000000-0000-4000-8000-000000000001 --sni www.intel.com --short-id AA --mode native || exit 87
 [[ $(< selected) = '65535|00000000-0000-4000-8000-000000000001|reality|www.intel.com|AA|x25519|native' ]] || exit 88
-if main install --port 65535 --uuid 00000000-0000-4000-8000-000000000001 --sni www.google.com; then exit 89; fi
+if (main install --port 65535 --uuid 00000000-0000-4000-8000-000000000001 --sni www.google.com); then exit 89; fi
 [[ ! -e mutated ]]
 ''')
  def test_native_links_roundtrip_and_retained_keys(self):
@@ -1214,7 +1222,7 @@ mode=sys.argv[1];link=pathlib.Path(mode+'.link').read_text().strip();p=urllib.pa
 assert p.scheme=='vless' and p.hostname=='2001:db8::7' and p.port==18443
 assert p.username=='00000000-0000-4000-8000-000000000000'
 assert q['encryption']==[pathlib.Path('encryption.info').read_text().strip()]
-assert q['type']==['tcp'] and q['flow']==['xtls-rprx-vision']
+assert q['type']==['tcp'] and q.get('flow',[]) == (['xtls-rprx-vision'] if mode=='reality' else [])
 assert urllib.parse.unquote(p.fragment)=='节点 +/# ? VLESS-E'+('-REALITY' if mode=='reality' else '')
 assert q['security']==['reality' if mode=='reality' else 'none']
 if mode=='reality':assert q['pbk'] and q['sid']==['aa'] and q['sni']==['www.nvidia.com']

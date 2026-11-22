@@ -362,7 +362,7 @@ write_config() {
           {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{users:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{method:"raw",security:"reality",realitySettings:{show:false,target:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}],outbounds:[{protocol:"freedom",settings:{},streamSettings:{sockopt:{domainStrategy:"UseIPv4v6"}}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
     else
         jq -n --argjson port "$port" --arg uuid "$uuid" --arg decryption "$decryption" '
-          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{users:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{method:"raw",security:"none"}}],outbounds:[{protocol:"freedom",settings:{},streamSettings:{sockopt:{domainStrategy:"UseIPv4v6"}}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
+          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{users:[{id:$uuid}],decryption:$decryption},streamSettings:{method:"raw",security:"none"}}],outbounds:[{protocol:"freedom",settings:{},streamSettings:{sockopt:{domainStrategy:"UseIPv4v6"}}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
     fi
     if [ "$preserve" = true ]; then
         if ! jq -se 'length == 1 and (.[0] | type == "object" and (.inbounds | type == "array" and length > 0))' "$XRAY_CONFIG" >/dev/null; then
@@ -377,6 +377,15 @@ write_config() {
             .settings.decryption = $new[0].inbounds[0].settings.decryption |
             .settings.users = (.settings.clients // .settings.users) | del(.settings.clients) |
             .settings.users[0].id = $new[0].inbounds[0].settings.users[0].id |
+            if $new[0].inbounds[0].settings.users[0].flow == null then
+              (.settings.flow // "") as $old_flow |
+              .settings.users |= (
+                [ (.[0] | del(.flow)) ] +
+                (.[1:] | map(if $old_flow != "" and ((.flow // "") == "") then .flow = $old_flow else . end))) |
+              .settings |= del(.flow)
+            else
+              .settings.users[0].flow = $new[0].inbounds[0].settings.users[0].flow
+            end |
             .streamSettings |= (
               .method = (.method // .network // "raw") |
               if .method == "tcp" then .method = "raw" else . end |
@@ -548,24 +557,27 @@ link_config() {
       if length == 1 then .[0].inbounds[0] else empty end |
       select(.protocol == "vless") |
       (.settings.clients // .settings.users)[0] as $user |
+      ($user.flow // "") as $user_flow |
+      (if $user_flow == "" then (.settings.flow // "") else $user_flow end) as $flow |
       (.streamSettings.method // .streamSettings.network // "raw") as $method |
       (.streamSettings.security // "none") as $security |
       select(($method == "tcp" or $method == "raw") and
-             ($security == "none" or $security == "reality") and
-             $user.flow == "xtls-rprx-vision" and $user.id and .port and
+             (($security == "reality" and $flow == "xtls-rprx-vision") or
+              ($security == "none" and ($flow == "" or $flow == "xtls-rprx-vision"))) and
+             $user.id and .port and
              (.settings.decryption | type == "string" and length > 0 and . != "none")) |
-      {uuid: $user.id, port, listen: (.listen // "::"), security: $security,
+      {uuid: $user.id, port, listen: (.listen // "::"), security: $security, flow: $flow,
        reality: .streamSettings.realitySettings}' "$XRAY_CONFIG" 2>/dev/null
 }
 
 show_subscription() {
-    local cfg address uuid port encryption security public sni sid link title seed verify="" keys
+    local cfg address uuid port encryption security flow flow_param public sni sid link title seed verify="" keys
     if [ ! -f "$XRAY_CONFIG" ] || [ ! -f "$ENCRYPTION_INFO" ]; then
         error "缺少配置或客户端信息。"
         return 1
     fi
     cfg=$(link_config) || {
-        error "首个入站不是可导出的 VLESS Encryption（RAW/TCP + Vision）配置。"
+        error "首个入站不是可导出的 VLESS Encryption（RAW/TCP，REALITY 使用 Vision）配置。"
         return 1
     }
     uuid=$(jq -r '.uuid' <<< "$cfg") || return 1
@@ -579,6 +591,7 @@ show_subscription() {
         error "公网地址为 IPv6，但入站监听不支持 IPv6，未生成订阅。"; return 1
     fi
     security=$(jq -r '.security' <<< "$cfg") || return 1
+    flow=$(jq -r '.flow' <<< "$cfg") || return 1
     if [ "$security" = reality ]; then
         [ -f "$REALITY_INFO" ] || { error "缺少 REALITY 客户端信息。"; return 1; }
         IFS='|' read -r public sni sid < "$REALITY_INFO" || return 1
@@ -614,7 +627,9 @@ show_subscription() {
         if [ -n "$verify" ]; then link="${link%%#*}&pqv=${verify}#${link#*#}"; fi
     else
         title="$(hostname) VLESS-E"
-        link="vless://${uuid}@${address}:${port}?encryption=$(uri_encode "$encryption")&flow=xtls-rprx-vision&type=tcp&security=none#$(uri_encode "$title")"
+        flow_param=""
+        [ -z "$flow" ] || flow_param="&flow=$(uri_encode "$flow")"
+        link="vless://${uuid}@${address}:${port}?encryption=$(uri_encode "$encryption")${flow_param}&type=tcp&security=none#$(uri_encode "$title")"
     fi
     local sub_tmp
     sub_tmp=$(mktemp "${SUBSCRIPTION_INFO}.tmp.XXXXXX") || return 1
@@ -627,7 +642,7 @@ show_subscription() {
     echo " 模式: $([ "$security" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
     echo " 地址: $address"; echo " 端口: $port"; echo " UUID: $uuid"
     echo " 传输: tcp | 安全: $security"
-    echo " 流控: xtls-rprx-vision"
+    if [ -n "$flow" ]; then echo " 流控: $flow"; else echo " 流控: 未启用"; fi
     [ "$security" = reality ] || echo " security=none：无 TLS 外层，仍由 VLESS Encryption 加密。"
     echo " 客户端 encryption: $encryption"
     [ "$security" != reality ] || { echo " SNI: $sni"; echo " Short ID: $sid"; echo " PublicKey: $public"; echo " 指纹: chrome"; }
@@ -1103,7 +1118,7 @@ interactive_install() {
     echo
     section_title "请选择安装模式（每次只能安装一种）"
     info "安装 / 重装覆盖 Xray 配置；请放行节点端口。"
-    info "客户端须支持 VLESS Encryption、encryption 参数及 Vision（xtls-rprx-vision）。"
+    info "客户端须支持 VLESS Encryption 及 encryption 参数；REALITY 还需要 Vision（xtls-rprx-vision）。"
     info "Encryption 自身加密；需要 TLS 外观选 + REALITY。"
     menu_item "$C_GREEN" "1." "VLESS Encryption"
     menu_item "$C_YELLOW" "2." "VLESS Encryption + REALITY"
@@ -1315,7 +1330,7 @@ Xray VLESS Unified Installer ${SCRIPT_VERSION}
   --short-id <ID>     REALITY Short ID：2-16 位偶数长度十六进制（默认：20220701）
   -h, --help         显示帮助
 
-两种模式均使用 Vision（xtls-rprx-vision）；客户端须支持 VLESS Encryption 及 encryption 参数。
+REALITY 使用 Vision（xtls-rprx-vision）；普通 VLESS Encryption 默认不启用流控。客户端须支持 VLESS Encryption 及 encryption 参数。
 Encryption 自身加密（security=none 不代表明文）；+ REALITY 增加 TLS 外观。
 SNI 是服务器可达、支持 TLS 1.3 的目标域名（443），无需自有域名或证书。
 REALITY SNI / 回落目标仅允许 www.nvidia.com、www.amd.com、www.intel.com；目标须从服务器可达并支持 TLS 1.3（443），且不应跳转到其他站点。实际连通性和跳转行为取决于服务器所在地区。
