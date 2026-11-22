@@ -1,0 +1,117 @@
+{
+  "platform": "Windows-11-10.0.26300-SP0",
+  "python": "3.13.7",
+  "reference": "Xray-core v26.11.9",
+  "rust": "vless-rust 0.1.0 release",
+  "load": {
+    "trials": 3,
+    "idle_connections": 64,
+    "streams": 4,
+    "mib_per_stream": 256
+  },
+  "notes": "Local loopback, same official client, payload hashes checked. RSS includes runtime and warmed pages; no claim about Linux or WAN speed.",
+  "results": [
+    {
+      "core": "rust",
+      "trial": 1,
+      "idle_memory": {
+        "rss_mib": 9.19140625,
+        "private_mib": 4.6171875,
+        "cpu_secs": 0.0625
+      },
+      "post_transfer_memory": {
+        "rss_mib": 9.83203125,
+        "private_mib": 5.4921875,
+        "cpu_secs": 1.953125
+      },
+      "elapsed_secs": 1.3385329999982787,
+      "throughput_mib_s": 765.0166264121369,
+      "server_cpu_secs": 1.890625
+    },
+    {
+      "core": "rust",
+      "trial": 2,
+      "idle_memory": {
+        "rss_mib": 9.11328125,
+        "private_mib": 4.57421875,
+        "cpu_secs": 0.046875
+      },
+      "post_transfer_memory": {
+        "rss_mib": 9.7578125,
+        "private_mib": 5.46875,
+        "cpu_secs": 1.703125
+      },
+      "elapsed_secs": 1.4234795999982452,
+      "throughput_mib_s": 719.3640147714532,
+      "server_cpu_secs": 1.65625
+    },
+    {
+      "core": "rust",
+      "trial": 3,
+      "idle_memory": {
+        "rss_mib": 9.16796875,
+        "private_mib": 4.60546875,
+        "cpu_secs": 0.0625
+      },
+      "post_transfer_memory": {
+        "rss_mib": 9.80078125,
+        "private_mib": 5.484375,
+        "cpu_secs": 1.59375
+      },
+      "elapsed_secs": 1.431929800000944,
+      "throughput_mib_s": 715.1188556864485,
+      "server_cpu_secs": 1.53125
+    },
+    {
+      "core": "xray",
+      "trial": 1,
+      "idle_memory": {
+        "rss_mib": 27.140625,
+        "private_mib": 56.71875,
+        "cpu_secs": 0.0625
+      },
+      "post_transfer_memory": {
+        "rss_mib": 31.8671875,
+        "private_mib": 61.07421875,
+        "cpu_secs": 1.796875
+      },
+      "elapsed_secs": 1.4762195000002976,
+      "throughput_mib_s": 693.6637810297138,
+      "server_cpu_secs": 1.734375
+    },
+    {
+      "core": "xray",
+      "trial": 2,
+      "idle_memory": {
+        "rss_mib": 27.59375,
+        "private_mib": 57.27734375,
+        "cpu_secs": 0.078125
+      },
+      "post_transfer_memory": {
+        "rss_mib": 31.32421875,
+        "private_mib": 60.35546875,
+        "cpu_secs": 1.953125
+      },
+      "elapsed_secs": 1.4619351999972423,
+      "throughput_mib_s": 700.4414422759173,
+      "server_cpu_secs": 1.875
+    },
+    {
+      "core": "xray",
+      "trial": 3,
+      "idle_memory": {
+        "rss_mib": 27.1328125,
+        "private_mib": 56.36328125,
+        "cpu_secs": 0.09375
+      },
+      "post_transfer_memory": {
+        "rss_mib": 31.37109375,
+        "private_mib": 60.265625,
+        "cpu_secs": 1.890625
+      },
+      "elapsed_secs": 1.495096000002377,
+      "throughput_mib_s": 684.9058521983685,
+      "server_cpu_secs": 1.796875
+    }
+  ]
+}

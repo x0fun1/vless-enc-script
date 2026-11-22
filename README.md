@@ -4,6 +4,8 @@
 
 一键安装和管理 Xray 的 **VLESS Encryption**，可选叠加 **REALITY**。客户端及其内核须支持 VLESS Encryption 和链接中的 `encryption` 参数；REALITY 模式还须支持 Vision（`xtls-rprx-vision`）。仅支持普通 VLESS/REALITY 的客户端不适用。
 
+独立 Rust 核心首版见 [rust-core/README.md](rust-core/README.md)：固定参照 Xray-core `v26.11.9`，支持普通 VLESS Encryption、TCP / UDP / Mux，并提供保活、限额和断流日志；暂不支持 REALITY / Vision。其安装和服务独立于下方原 Xray 脚本，验证范围与性能记录见 [rust-core/VALIDATION.md](rust-core/VALIDATION.md)。
+
 ## 使用
 
 需要 **root、Bash、curl、systemd**；依赖安装支持 apt、dnf 或 yum。首次在交互终端运行：

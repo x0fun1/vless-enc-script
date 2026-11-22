@@ -1,0 +1,247 @@
+{
+  "date": "2026-11-22",
+  "reference": "Xray-core v26.11.9",
+  "rust": "vless-rust 0.1.0",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "release_executable": {
+    "platform": "windows-x86_64",
+    "size_bytes": 1353216,
+    "sha256": "DB17BA318C5CEC858576B41A5E668204441305A682127B0E80294740225B7833"
+  },
+  "unit_tests": {
+    "passed": 11
+  },
+  "regression_tests": {
+    "passed": 6
+  },
+  "checks": {
+    "release_build": "passed",
+    "clippy_all_targets_deny_warnings": "passed",
+    "bash_syntax": "passed",
+    "installer_help": "passed",
+    "python_syntax": "passed"
+  },
+  "cases": [
+    {
+      "case": "x25519-native-aes-mux0",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "x25519-native-aes-mux1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": false
+    },
+    {
+      "case": "x25519-native-chacha-mux0",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": true
+    },
+    {
+      "case": "x25519-native-chacha-mux1",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": false
+    },
+    {
+      "case": "x25519-xorpub-aes-mux0",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "x25519-xorpub-aes-mux1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": false
+    },
+    {
+      "case": "x25519-xorpub-chacha-mux0",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": true
+    },
+    {
+      "case": "x25519-xorpub-chacha-mux1",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": false
+    },
+    {
+      "case": "x25519-random-aes-mux0",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "x25519-random-aes-mux1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": false
+    },
+    {
+      "case": "x25519-random-chacha-mux0",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": true
+    },
+    {
+      "case": "x25519-random-chacha-mux1",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": false
+    },
+    {
+      "case": "mlkem768-native-aes-mux0",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "mlkem768-native-aes-mux1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": false
+    },
+    {
+      "case": "mlkem768-native-chacha-mux0",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": true
+    },
+    {
+      "case": "mlkem768-native-chacha-mux1",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": false
+    },
+    {
+      "case": "mlkem768-xorpub-aes-mux0",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "mlkem768-xorpub-aes-mux1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": false
+    },
+    {
+      "case": "mlkem768-xorpub-chacha-mux0",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": true
+    },
+    {
+      "case": "mlkem768-xorpub-chacha-mux1",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": false
+    },
+    {
+      "case": "mlkem768-random-aes-mux0",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "mlkem768-random-aes-mux1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": false
+    },
+    {
+      "case": "mlkem768-random-chacha-mux0",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": true
+    },
+    {
+      "case": "mlkem768-random-chacha-mux1",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": false
+    },
+    {
+      "case": "x25519-native-aes-mux-1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "x25519-xorpub-aes-mux-1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "x25519-random-aes-mux-1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "mlkem768-native-aes-mux-1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "mlkem768-xorpub-aes-mux-1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "mlkem768-random-aes-mux-1",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "relay8-native-aes-mux0",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "relay8-native-chacha-mux0",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": true
+    },
+    {
+      "case": "relay8-xorpub-aes-mux0",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "relay8-xorpub-chacha-mux0",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": true
+    },
+    {
+      "case": "relay8-random-aes-mux0",
+      "result": "passed",
+      "cipher_verified": "Aes",
+      "resumption_verified": true
+    },
+    {
+      "case": "relay8-random-chacha-mux0",
+      "result": "passed",
+      "cipher_verified": "ChaCha",
+      "resumption_verified": true
+    }
+  ],
+  "not_verified": [
+    "Linux compilation and systemd runtime",
+    "Long-running WAN deployment",
+    "REALITY and Vision (outside this release)"
+  ]
+}
