@@ -43,8 +43,8 @@ if [ -z "$BINARY" ]; then
 fi
 [ -x "$BINARY" ] || { printf 'Binary is not executable.\n' >&2; exit 1; }
 case "$("$BINARY" version)" in
-    'vless-rust 0.1.0 reference Xray-core v26.11.9') ;;
-    *) printf 'Expected vless-rust 0.1.0, reference Xray-core v26.11.9.\n' >&2; exit 1 ;;
+    'vless-rust 0.1.1 reference Xray-core v26.11.9') ;;
+    *) printf 'Expected vless-rust 0.1.1, reference Xray-core v26.11.9.\n' >&2; exit 1 ;;
 esac
 "$BINARY" check --config "$CONFIG"
 
@@ -128,4 +128,4 @@ if [ "$WAS_ACTIVE" = true ] || [ "$WAS_ENABLED" = absent ]; then
         [ "$pid" = "$(systemctl show --property=MainPID --value vless-rust)" ] ||
         { printf 'Rust service did not stay running; see journalctl -u vless-rust.\n' >&2; exit 1; }
 fi
-printf 'Installed vless-rust 0.1.0. Logs: journalctl -u vless-rust -f --no-pager\n'
+printf 'Installed vless-rust 0.1.1. Logs: journalctl -u vless-rust -f --no-pager\n'

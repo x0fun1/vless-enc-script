@@ -23,7 +23,7 @@ use ml_kem::{
 use rand::{RngCore, rngs::OsRng};
 use std::{
     env,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::Write,
     net::SocketAddr,
     path::Path,
@@ -40,6 +40,54 @@ use zeroize::Zeroizing;
 
 const REFERENCE: &str = "Xray-core v26.11.9";
 
+fn public_key(private: &[u8]) -> Result<Vec<u8>> {
+    if private.len() == 32 {
+        let secret = StaticSecret::from(<[u8; 32]>::try_from(private)?);
+        Ok(PublicKey::from(&secret).as_bytes().to_vec())
+    } else {
+        Ok(
+            ml_kem::DecapsulationKey::<MlKem768>::new_from_slice(private)?
+                .encapsulation_key()
+                .to_bytes()
+                .to_vec(),
+        )
+    }
+}
+
+fn subscription(config: &Config, host: &str) -> Result<String> {
+    ensure!(
+        !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c)),
+        "invalid subscription host"
+    );
+    let parsed = EncryptionConfig::parse(&config.decryption)?;
+    let appearance = match parsed.appearance {
+        config::Appearance::Native => "native",
+        config::Appearance::XorPub => "xorpub",
+        config::Appearance::Random => "random",
+    };
+    let mut encryption = format!(
+        "mlkem768x25519plus.{appearance}.{}",
+        if parsed.lifetime == 0 { "1rtt" } else { "0rtt" }
+    );
+    for key in &parsed.keys {
+        encryption.push('.');
+        encryption.push_str(&URL_SAFE_NO_PAD.encode(public_key(key)?));
+    }
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let uuid = config.users.first().context("missing user UUID")?;
+    Ok(format!(
+        "vless://{uuid}@{host}:{}?encryption={encryption}&security=none&type=tcp#VLESS-Rust",
+        config.listen.port()
+    ))
+}
+
 fn keypair(auth: &str, appearance: &str) -> Result<(String, String)> {
     ensure!(
         ["native", "xorpub", "random"].contains(&appearance),
@@ -54,15 +102,7 @@ fn keypair(auth: &str, appearance: &str) -> Result<(String, String)> {
         }
     ]);
     OsRng.fill_bytes(&mut private);
-    let public = if private.len() == 32 {
-        let secret = StaticSecret::from(<[u8; 32]>::try_from(private.as_slice())?);
-        PublicKey::from(&secret).as_bytes().to_vec()
-    } else {
-        ml_kem::DecapsulationKey::<MlKem768>::new_from_slice(&private)?
-            .encapsulation_key()
-            .to_bytes()
-            .to_vec()
-    };
+    let public = public_key(&private)?;
     Ok((
         format!(
             "mlkem768x25519plus.{appearance}.600s.{}",
@@ -91,6 +131,236 @@ fn write_new_config(path: &Path, config: &Config) -> Result<()> {
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
+}
+
+fn replace_config(path: &Path, config: &Config) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).context("inspect configuration")?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "configuration must be a regular file"
+    );
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temporary)
+            .context("create replacement configuration")?;
+        let bytes = Zeroizing::new(serde_json::to_vec_pretty(config)?);
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path).context("commit replacement configuration")?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn import_xray_config(
+    input: &Path,
+    output: &Path,
+    listen_host: std::net::IpAddr,
+    port: Option<u16>,
+) -> Result<()> {
+    let source = Zeroizing::new(fs::read(input).context("read existing Xray configuration")?);
+    ensure!(
+        source.len() <= 1024 * 1024,
+        "Xray configuration exceeds 1 MiB"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&source)?;
+    ensure!(value.is_object(), "Xray configuration must be an object");
+    let root = value.as_object().context("invalid Xray configuration")?;
+    ensure!(
+        root.keys()
+            .all(|k| ["log", "inbounds", "outbounds"].contains(&k.as_str())),
+        "routing, DNS, policy, and other root settings need manual migration"
+    );
+
+    let inbounds = root
+        .get("inbounds")
+        .and_then(serde_json::Value::as_array)
+        .context("missing Xray inbounds")?;
+    ensure!(
+        inbounds.len() == 1,
+        "migration requires exactly one Xray inbound"
+    );
+    let inbound = inbounds[0].as_object().context("invalid Xray inbound")?;
+    ensure!(
+        inbound.keys().all(|k| [
+            "listen",
+            "port",
+            "protocol",
+            "settings",
+            "streamSettings",
+            "tag"
+        ]
+        .contains(&k.as_str())),
+        "Xray inbound has unsupported extensions"
+    );
+    ensure!(
+        inbound.get("protocol").and_then(serde_json::Value::as_str) == Some("vless"),
+        "only a VLESS inbound can be migrated"
+    );
+    let original_port = inbound
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .context("invalid Xray inbound port")?;
+    ensure!(
+        (1..=65535).contains(&original_port),
+        "invalid Xray inbound port"
+    );
+
+    let stream = inbound
+        .get("streamSettings")
+        .and_then(serde_json::Value::as_object)
+        .context("missing Xray stream settings")?;
+    ensure!(
+        stream
+            .keys()
+            .all(|k| ["security", "method", "network"].contains(&k.as_str())),
+        "custom Xray transport settings cannot be migrated"
+    );
+    ensure!(
+        stream
+            .get("security")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("none")
+            == "none",
+        "Xray REALITY/TLS cannot be migrated to the plain Rust core"
+    );
+    ensure!(
+        matches!(
+            stream
+                .get("method")
+                .or_else(|| stream.get("network"))
+                .and_then(serde_json::Value::as_str),
+            None | Some("raw") | Some("tcp")
+        ),
+        "only raw TCP transport can be migrated"
+    );
+
+    let settings = inbound
+        .get("settings")
+        .and_then(serde_json::Value::as_object)
+        .context("missing Xray VLESS settings")?;
+    ensure!(
+        settings
+            .keys()
+            .all(|k| ["users", "clients", "decryption", "flow"].contains(&k.as_str())),
+        "Xray VLESS settings have unsupported extensions"
+    );
+    ensure!(
+        settings
+            .get("flow")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .is_empty(),
+        "Vision flow cannot be migrated to the plain Rust core"
+    );
+    let users = settings
+        .get("clients")
+        .or_else(|| settings.get("users"))
+        .and_then(serde_json::Value::as_array)
+        .context("missing Xray VLESS users")?;
+    ensure!(
+        !users.is_empty() && users.len() <= 4096,
+        "Xray user count must be 1..4096"
+    );
+    let mut migrated_users = Vec::with_capacity(users.len());
+    for user in users {
+        let user = user.as_object().context("invalid Xray VLESS user")?;
+        ensure!(
+            user.keys()
+                .all(|k| ["id", "flow", "email", "level"].contains(&k.as_str())),
+            "Xray VLESS user has unsupported extensions"
+        );
+        ensure!(
+            user.get("flow")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .is_empty(),
+            "Vision flow cannot be migrated to the plain Rust core"
+        );
+        ensure!(
+            user.get("level")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                == 0,
+            "nonzero Xray user levels require routing migration"
+        );
+        migrated_users.push(
+            user.get("id")
+                .and_then(serde_json::Value::as_str)
+                .context("missing Xray user UUID")?
+                .parse::<Uuid>()
+                .context("invalid Xray user UUID")?,
+        );
+    }
+
+    let outbounds = root
+        .get("outbounds")
+        .and_then(serde_json::Value::as_array)
+        .context("missing Xray outbounds")?;
+    ensure!(
+        outbounds.len() == 1,
+        "migration requires a single direct freedom outbound"
+    );
+    let outbound = outbounds[0].as_object().context("invalid Xray outbound")?;
+    ensure!(
+        outbound
+            .keys()
+            .all(|k| ["protocol", "settings", "streamSettings", "tag"].contains(&k.as_str())),
+        "Xray outbound has unsupported extensions"
+    );
+    ensure!(
+        outbound.get("protocol").and_then(serde_json::Value::as_str) == Some("freedom"),
+        "only a direct freedom outbound can be migrated"
+    );
+    let outbound_settings = outbound.get("settings");
+    ensure!(
+        outbound_settings.is_none()
+            || outbound_settings
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|settings| settings.is_empty()),
+        "custom freedom settings cannot be migrated"
+    );
+    let outbound_stream = outbound
+        .get("streamSettings")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    ensure!(
+        outbound_stream == serde_json::json!({})
+            || outbound_stream == serde_json::json!({"sockopt":{"domainStrategy":"UseIPv4v6"}}),
+        "custom freedom socket settings cannot be migrated"
+    );
+
+    let original_decryption = settings
+        .get("decryption")
+        .and_then(serde_json::Value::as_str)
+        .context("missing Xray VLESS decryption key")?;
+    EncryptionConfig::parse(original_decryption)
+        .context("Xray VLESS decryption is not supported by the Rust core")?;
+    let config = Config {
+        listen: SocketAddr::new(listen_host, port.unwrap_or(original_port as u16)),
+        users: migrated_users,
+        decryption: original_decryption.to_owned(),
+        limits: Limits::default(),
+        log_connections: false,
+    };
+    config.validate()?;
+    write_new_config(output, &config)
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -206,7 +476,7 @@ fn main() -> Result<()> {
     let command = args.first().map(String::as_str).unwrap_or("help");
     if ["help", "--help", "-h"].contains(&command) {
         println!(
-            "vless-rust {} (reference {REFERENCE})\n\nCommands:\n  init --config FILE --host HOST [--port PORT] [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  keygen [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  check --config FILE\n  run --config FILE\n  version\n\nSupports plain VLESS Encryption, TCP/UDP and XUDP. REALITY and Vision are not supported.\nConfiguration contains private keys: keep it private.",
+            "vless-rust {} (reference {REFERENCE})\n\nCommands:\n  init --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  configure --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--rekey] [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  link --config FILE --host HOST\n  keygen [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  check --config FILE\n  run --config FILE\n  version\n\nSupports plain VLESS Encryption, TCP/UDP and XUDP. REALITY and Vision are not supported.\nConfiguration contains private keys: keep it private.",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -220,27 +490,61 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut path = None;
+    let mut input = None;
     let mut host = None;
-    let mut port = 443u16;
-    let mut auth = "x25519";
-    let mut mode = "native";
+    let mut port = None;
+    let mut listen_host = None;
+    let mut uuid = None;
+    let mut auth = None;
+    let mut mode = None;
+    let mut rekey = false;
     let mut i = 1;
     while i < args.len() {
         let option = args[i].as_str();
+        if command == "configure" && option == "--rekey" {
+            rekey = true;
+            i += 1;
+            continue;
+        }
         let value = args.get(i + 1).context("missing option value")?;
         match (command, option) {
-            ("run" | "check" | "init", "--config" | "-config") => path = Some(value),
-            ("init", "--host") => host = Some(value),
-            ("init", "--port") => port = value.parse().context("invalid port")?,
-            ("keygen" | "init", "--auth") => auth = value,
-            ("keygen" | "init", "--mode") => mode = value,
+            ("run" | "check" | "init" | "configure" | "link", "--config" | "-config") => {
+                path = Some(value)
+            }
+            ("init" | "configure" | "link", "--host") => host = Some(value),
+            ("init" | "configure", "--listen-host") => {
+                listen_host = Some(
+                    value
+                        .parse::<std::net::IpAddr>()
+                        .context("invalid listen IP")?,
+                )
+            }
+            ("init" | "configure", "--port") => {
+                port = Some(value.parse::<u16>().context("invalid port")?)
+            }
+            ("init" | "configure", "--uuid") => {
+                uuid = Some(value.parse::<Uuid>().context("invalid UUID")?)
+            }
+            ("import-xray", "--input") => input = Some(value),
+            ("import-xray", "--output") => path = Some(value),
+            ("import-xray", "--listen-host") => {
+                listen_host = Some(
+                    value
+                        .parse::<std::net::IpAddr>()
+                        .context("invalid listen IP")?,
+                )
+            }
+            ("import-xray", "--port") => port = Some(value.parse::<u16>().context("invalid port")?),
+            ("keygen" | "init" | "configure", "--auth") => auth = Some(value.as_str()),
+            ("keygen" | "init" | "configure", "--mode") => mode = Some(value.as_str()),
             _ => bail!("unknown command or option: {command} {option}"),
         }
         i += 2;
     }
     match command {
         "keygen" => {
-            let (decryption, encryption) = keypair(auth, mode)?;
+            let (decryption, encryption) =
+                keypair(auth.unwrap_or("x25519"), mode.unwrap_or("native"))?;
             println!(
                 "{}",
                 serde_json::json!({"decryption": decryption, "encryption": encryption})
@@ -256,25 +560,70 @@ fn main() -> Result<()> {
                         .all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c)),
                 "invalid subscription host"
             );
-            let (decryption, encryption) = keypair(auth, mode)?;
-            let uuid = Uuid::new_v4();
+            let (decryption, _) = keypair(auth.unwrap_or("x25519"), mode.unwrap_or("native"))?;
+            let uuid = uuid.unwrap_or_else(Uuid::new_v4);
             let config = Config {
-                listen: SocketAddr::new("::".parse()?, port),
+                listen: SocketAddr::new(listen_host.unwrap_or("::".parse()?), port.unwrap_or(443)),
                 users: vec![uuid],
                 decryption,
                 limits: Limits::default(),
                 log_connections: false,
             };
             config.validate()?;
+            let link = subscription(&config, host)?;
             write_new_config(path, &config)?;
-            let host = if host.contains(':') && !host.starts_with('[') {
-                format!("[{host}]")
-            } else {
-                host.to_owned()
-            };
+            println!("{link}");
+        }
+        "link" => {
+            let config = Config::load(Path::new(path.context("--config required")?))?;
             println!(
-                "vless://{uuid}@{host}:{port}?encryption={encryption}&security=none&type=tcp#VLESS-Rust"
+                "{}",
+                subscription(&config, host.context("--host required")?)?
             );
+        }
+        "configure" => {
+            let path = Path::new(path.context("--config required")?);
+            let mut config = Config::load(path)?;
+            let old = EncryptionConfig::parse(&config.decryption)?;
+            let old_auth = if old.keys.first().context("missing auth key")?.len() == 32 {
+                "x25519"
+            } else {
+                "mlkem768"
+            };
+            let old_mode = match old.appearance {
+                config::Appearance::Native => "native",
+                config::Appearance::XorPub => "xorpub",
+                config::Appearance::Random => "random",
+            };
+            let new_auth = auth.unwrap_or(old_auth);
+            let new_mode = mode.unwrap_or(old_mode);
+            ensure!(
+                rekey || (new_auth == old_auth && new_mode == old_mode),
+                "changing auth or mode requires --rekey"
+            );
+            if rekey {
+                config.decryption = keypair(new_auth, new_mode)?.0;
+            }
+            config.listen = SocketAddr::new(
+                listen_host.unwrap_or(config.listen.ip()),
+                port.unwrap_or(config.listen.port()),
+            );
+            if let Some(uuid) = uuid {
+                *config.users.first_mut().context("missing user UUID")? = uuid;
+            }
+            config.validate()?;
+            let link = subscription(&config, host.context("--host required")?)?;
+            replace_config(path, &config)?;
+            println!("{link}");
+        }
+        "import-xray" => {
+            import_xray_config(
+                Path::new(input.context("--input required")?),
+                Path::new(path.context("--output required")?),
+                listen_host.unwrap_or("::".parse()?),
+                port,
+            )?;
+            println!("Xray configuration imported");
         }
         "run" | "check" => {
             let path = Path::new(path.context("--config required")?);

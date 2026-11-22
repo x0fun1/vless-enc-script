@@ -1,6 +1,6 @@
 # 独立 VLESS Encryption Rust 核心
 
-版本 **0.1.0**。协议参照固定的 **Xray-core v26.11.9**，编译工具链固定为 **Rust 1.100.0**，依赖通过 `Cargo.lock` 锁定。进程自身完成加密握手、记录层和转发，不启动或嵌入 Go Xray。
+版本 **0.1.1**。协议参照固定的 **Xray-core v26.11.9**，编译工具链固定为 **Rust 1.100.0**，依赖通过 `Cargo.lock` 锁定。进程自身完成加密握手、记录层和转发，不启动或嵌入 Go Xray。
 
 当前是经过本机互通验证的首版，尚未经过独立安全审计或 Linux 长时间运行验证。Linux systemd 安装脚本已提供，生产环境应先使用独立端口试运行。实际性能记录见 [VALIDATION.md](VALIDATION.md)。
 
@@ -40,17 +40,17 @@ cargo build --release --locked
 
 `keygen` 只输出两端的 Encryption 参数 JSON，不修改文件。配置和生成的链接均含连接凭据。
 
-## Linux systemd 安装
+## Linux systemd 一键安装
 
-准备 Rust 配置后，从仓库根目录执行：
+在 Linux systemd 主机以 root 运行仓库根目录的一键脚本：
 
 ```bash
-sudo bash rust-core/install.sh --config rust-core/rust.json
+bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main/install.sh)
 ```
 
-安装脚本先构建固定版本并校验配置，然后安装独立服务。也可用 `--binary /path/to/vless-rust` 提供事先构建的 **Linux** 可执行文件；安装脚本检查版本必须为 `0.1.0`。
+可用 `--port`、`--host`、`--auth` 和 `--mode` 指定监听端口、公网地址、认证模式与流量外观；省略 `--host` 时尝试自动检测公网地址。脚本下载固定源码并校验关键文件、安装 Rust 1.100.0、构建核心、生成配置和客户端链接，再安装并启动 systemd 服务。链接保存在 `/root/vless-rust_link.txt`。本地仓库也可用 `sudo bash rust-core/install.sh --config FILE` 安装已有配置，或加 `--binary FILE` 安装预构建 Linux 二进制。
 
-- 核心：`/usr/local/bin/vless-rust`。
+安装目标：`/usr/local/bin/vless-rust`。
 - 配置：`/usr/local/etc/vless-rust/config.json`，`root:vless-rust`、`0640`。
 - 服务：`vless-rust.service`；独立系统账户，允许监听低端口。
 - 故障退出 5 秒后重启，60 秒最多 5 次，防止配置错误反复重启。触及限制后，修复问题并运行 `systemctl reset-failed vless-rust && systemctl start vless-rust`。

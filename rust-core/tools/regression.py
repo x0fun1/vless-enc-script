@@ -42,6 +42,46 @@ class Regression(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(path.read_text(), "original")
 
+    def test_link_reconstructs_existing_credentials(self):
+        for auth in ("x25519", "mlkem768"):
+            for appearance in ("native", "xorpub", "random"):
+                with self.subTest(auth=auth, mode=appearance), tempfile.TemporaryDirectory() as directory:
+                    path = pathlib.Path(directory) / "config.json"
+                    keys = json.loads(subprocess.check_output([str(RUST), "keygen", "--auth", auth, "--mode", appearance], text=True, creationflags=CREATE_FLAGS))
+                    value = self.config(18443)
+                    value["decryption"] = keys["decryption"]
+                    path.write_text(json.dumps(value))
+                    before = path.read_bytes()
+                    link = subprocess.check_output([str(RUST), "link", "--config", str(path), "--host", "2001:db8::1"], text=True, creationflags=CREATE_FLAGS).strip()
+                    self.assertIn(f"encryption={keys['encryption']}", link)
+                    self.assertIn("@[2001:db8::1]:18443?", link)
+                    self.assertEqual(before, path.read_bytes())
+
+    def test_init_accepts_requested_uuid_and_link_roundtrips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "config.json"
+            uid = str(uuid.uuid4())
+            created = subprocess.check_output([str(RUST), "init", "--config", str(path), "--host", "example.com", "--uuid", uid], text=True, creationflags=CREATE_FLAGS).strip()
+            rebuilt = subprocess.check_output([str(RUST), "link", "--config", str(path), "--host", "example.com"], text=True, creationflags=CREATE_FLAGS).strip()
+            self.assertEqual(created, rebuilt)
+            self.assertTrue(created.startswith(f"vless://{uid}@"))
+
+    def test_configure_preserves_keys_until_explicit_rekey(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "config.json"
+            keys = json.loads(subprocess.check_output([str(RUST), "keygen", "--auth", "mlkem768", "--mode", "xorpub"], text=True, creationflags=CREATE_FLAGS))
+            value = self.config(443)
+            value["decryption"] = keys["decryption"]
+            path.write_text(json.dumps(value))
+            result = subprocess.run([str(RUST), "configure", "--config", str(path), "--host", "example.com", "--auth", "x25519"], capture_output=True, text=True, creationflags=CREATE_FLAGS)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(json.loads(path.read_text())["decryption"], keys["decryption"])
+            link = subprocess.check_output([str(RUST), "configure", "--config", str(path), "--host", "example.com", "--listen-host", "127.0.0.1", "--port", "18443", "--uuid", str(uuid.uuid4()), "--auth", "x25519", "--mode", "random", "--rekey"], text=True, creationflags=CREATE_FLAGS)
+            updated = json.loads(path.read_text())
+            self.assertEqual(updated["listen"], "127.0.0.1:18443")
+            self.assertNotEqual(updated["decryption"], keys["decryption"])
+            self.assertIn("mlkem768x25519plus.random.0rtt.", link)
+
     def test_migration_preserves_credentials_and_rejects_extensions(self):
         uid = str(uuid.uuid4())
         value = {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "::", "port": 443, "protocol": "vless", "settings": {"users": [{"id": uid}], "decryption": self.keys["decryption"]}, "streamSettings": {"method": "raw", "security": "none"}}], "outbounds": [{"protocol": "freedom", "settings": {}, "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4v6"}}}]}
