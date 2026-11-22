@@ -56,9 +56,13 @@ class DeploymentInstallerTests(unittest.TestCase):
         self.assertIn('CORE_VERSION="0.1.1"', root_installer)
         self.assertIn('releases/download/vless-rust-v${CORE_VERSION}', root_installer)
         self.assertIn('vless-rust-linux-${asset_arch}.sha256', root_installer)
-        self.assertNotIn("cargo build", root_installer)
+        self.assertIn('"$release_url/venc"', root_installer)
         self.assertIn("shuf -i 10000-60000", root_installer)
         self.assertIn("Client configuration (VLESS + ENC)", root_installer)
+        self.assertNotIn("cargo build", root_installer)
+        manager = (ROOT / "rust-core/venc").read_text(encoding="utf-8")
+        for menu_item in ("1) create_node", "2) delete_node", "3) show_node", "5) uninstall_core"):
+            self.assertIn(menu_item, manager)
         workflow = (ROOT / ".github/workflows/rust-core-release.yml").read_text(encoding="utf-8")
         self.assertIn("arch: x86_64", workflow)
         self.assertIn("arch: aarch64", workflow)
@@ -66,7 +70,7 @@ class DeploymentInstallerTests(unittest.TestCase):
 
     def test_install_scripts_parse(self):
         result = subprocess.run(
-            ["bash", "-n", str(INSTALLER), str(ROOT / "rust-core/install.sh")],
+            ["bash", "-n", str(INSTALLER), str(ROOT / "rust-core/install.sh"), str(ROOT / "rust-core/venc")],
             capture_output=True,
             text=True,
             timeout=15,

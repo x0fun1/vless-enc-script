@@ -49,7 +49,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: rust-core/Cargo.toml
+          sparse-checkout: |
+            rust-core/Cargo.toml
+            rust-core/venc
       - uses: actions/download-artifact@v4
         with:
           pattern: vless-rust-*
@@ -62,6 +64,10 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' rust-core/Cargo.toml | head -n 1)
           test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Package management command
+        run: |
+          install -m 0755 rust-core/venc dist/venc
+          sha256sum dist/venc | awk '{print $1}' > dist/venc.sha256
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: vless-rust-v${{ steps.package.outputs.version }}

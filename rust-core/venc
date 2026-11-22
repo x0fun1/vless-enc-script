@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CORE=/usr/local/bin/vless-rust
+CONFIG=/usr/local/etc/vless-rust/config.json
+CONFIG_DIR=/usr/local/etc/vless-rust
+LINK=/root/vless-rust_link.txt
+HOST_FILE=/usr/local/etc/vless-rust/public-host
+UNIT=/etc/systemd/system/vless-rust.service
+
+fail() { printf 'Error: %s\n' "$*" >&2; }
+require_root() {
+    [[ "$(id -u)" == 0 ]] || { fail 'Run venc with sudo or as root.'; return 1; }
+}
+
+random_port() {
+    local candidate listeners attempt
+    for attempt in {1..100}; do
+        candidate=$(shuf -i 10000-60000 -n 1)
+        listeners=$(ss -H -ltn "sport = :$candidate") || return 1
+        if [[ -z "$listeners" ]]; then printf '%s\n' "$candidate"; return 0; fi
+    done
+    return 1
+}
+
+public_host() {
+    local host
+    host=$(curl --proto '=https' --tlsv1.2 -4fsS --max-time 8 https://api.ipify.org || true)
+    if [[ ! "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        host=$(curl --proto '=https' --tlsv1.2 -6fsS --max-time 8 https://api64.ipify.org || true)
+    fi
+    [[ -n "$host" ]] || return 1
+    printf '%s\n' "$host"
+}
+
+rollback_configuration() {
+    local backup=$1 was_active=$2
+    if [[ -n "$backup" ]]; then
+        mv -f "$backup" "$CONFIG" || return 1
+        [[ "$was_active" != true ]] || systemctl restart vless-rust || true
+    else
+        rm -f "$CONFIG"
+        systemctl disable --now vless-rust >/dev/null 2>&1 || true
+    fi
+}
+
+save_private_file() {
+    local path=$1 value=$2 temporary
+    temporary=$(mktemp "${path}.tmp.XXXXXX") || return 1
+    if ! printf '%s\n' "$value" > "$temporary" || ! chmod 0600 "$temporary" || ! mv -Tf "$temporary" "$path"; then
+        rm -f "$temporary"
+        return 1
+    fi
+}
+
+show_node() {
+    local host link uuid endpoint port
+    [[ -x "$CORE" && -f "$CONFIG" ]] || { fail 'No configured node was found.'; return 1; }
+    host=$(<"$HOST_FILE") || return 1
+    [[ -n "$host" ]] || { fail 'Public host is missing; create the node again.'; return 1; }
+    link=$("$CORE" link --config "$CONFIG" --host "$host") || return 1
+    uuid=${link#vless://}; uuid=${uuid%%@*}
+    endpoint=${link#*@}; endpoint=${endpoint%%\?*}
+    port=${endpoint##*:}
+    printf '\nVLESS+ENC 节点信息\n'
+    printf '地址: %s\n端口: %s/TCP\nUUID: %s\n' "$host" "$port" "$uuid"
+    printf '客户端配置:\n%s\n\n' "$link"
+}
+
+create_node() {
+    local host port auth mode uuid input link backup='' was_active=false pid
+    [[ -x "$CORE" ]] || { fail 'vless-rust core is not installed.'; return 1; }
+    host=$(<"$HOST_FILE" 2>/dev/null || true)
+    if [[ -z "$host" ]]; then host=$(public_host) || { fail 'Could not detect the VPS public IP.'; return 1; }; fi
+    read -r -p "VPS 公网 IP/域名 [$host]: " input || return 1
+    host=${input:-$host}
+    [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || { fail 'Invalid public IP/host.'; return 1; }
+
+    port=$(random_port) || { fail 'Could not find a free port from 10000 to 60000.'; return 1; }
+    read -r -p "TCP 端口 [$port]: " input || return 1
+    port=${input:-$port}
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || { fail 'Invalid port.'; return 1; }
+    [[ -z "$(ss -H -ltn "sport = :$port")" ]] || { fail "TCP port $port is already in use."; return 1; }
+
+    read -r -p '认证方式 (x25519/mlkem768) [x25519]: ' auth || return 1
+    auth=${auth:-x25519}
+    [[ "$auth" == x25519 || "$auth" == mlkem768 ]] || { fail 'Invalid auth mode.'; return 1; }
+    read -r -p '流量外观 (native/xorpub/random) [native]: ' mode || return 1
+    mode=${mode:-native}
+    [[ "$mode" == native || "$mode" == xorpub || "$mode" == random ]] || { fail 'Invalid traffic appearance.'; return 1; }
+    uuid=$(< /proc/sys/kernel/random/uuid)
+
+    systemctl is-active --quiet vless-rust && was_active=true || true
+    if [[ -f "$CONFIG" ]]; then
+        backup=$(mktemp "${CONFIG}.backup.XXXXXX") || return 1
+        cp -p "$CONFIG" "$backup" || { rm -f "$backup"; return 1; }
+        link=$("$CORE" configure --config "$CONFIG" --host "$host" --port "$port" --uuid "$uuid" --auth "$auth" --mode "$mode" --rekey) || {
+            rollback_configuration "$backup" "$was_active" || true
+            return 1
+        }
+    else
+        link=$("$CORE" init --config "$CONFIG" --host "$host" --port "$port" --uuid "$uuid" --auth "$auth" --mode "$mode") || {
+            rm -f "$CONFIG"; return 1;
+        }
+    fi
+    if ! chown root:vless-rust "$CONFIG" || ! chmod 0640 "$CONFIG"; then
+        rollback_configuration "$backup" "$was_active" || true
+        return 1
+    fi
+
+    if ! systemctl enable vless-rust >/dev/null ||
+       ! { if [[ "$was_active" == true ]]; then systemctl restart vless-rust; else systemctl start vless-rust; fi; }; then
+        fail 'Service failed to start; restoring the previous configuration.'
+        rollback_configuration "$backup" "$was_active" || true
+        return 1
+    fi
+    pid=$(systemctl show --property=MainPID --value vless-rust)
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || {
+        fail 'Service has no running main process.'
+        rollback_configuration "$backup" "$was_active" || true
+        return 1
+    }
+    sleep 3
+    if ! systemctl is-active --quiet vless-rust || [[ "$pid" != "$(systemctl show --property=MainPID --value vless-rust)" ]]; then
+        fail 'Service did not remain stable; restoring the previous configuration.'
+        rollback_configuration "$backup" "$was_active" || true
+        return 1
+    fi
+    [[ -z "$backup" ]] || rm -f "$backup"
+    save_private_file "$HOST_FILE" "$host" || fail 'Could not save the public host.'
+    save_private_file "$LINK" "$link" || fail 'Could not save the client link.'
+    printf '\nNode configured and service is running.\n'
+    show_node
+}
+
+delete_node() {
+    local answer
+    [[ -f "$CONFIG" ]] || { fail 'No configured node was found.'; return 1; }
+    read -r -p 'Delete the node configuration and client link? [y/N] ' answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    systemctl disable --now vless-rust || return 1
+    rm -f "$CONFIG" "$LINK" "$HOST_FILE"
+    printf 'Node deleted. The core remains installed; use option 1 to create a node again.\n'
+}
+
+uninstall_core() {
+    local answer
+    read -r -p 'Remove the Rust service, core, node configuration, and venc command? [y/N] ' answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    systemctl disable --now vless-rust >/dev/null 2>&1 || true
+    rm -f "$UNIT" "$CORE" /usr/local/bin/venc "$LINK" "$HOST_FILE"
+    rm -rf "$CONFIG_DIR" /etc/systemd/system/vless-rust.service.d
+    systemctl daemon-reload || return 1
+    systemctl reset-failed vless-rust >/dev/null 2>&1 || true
+    printf 'Rust core and venc command removed. The vless-rust system account was left intact.\n'
+    exit 0
+}
+
+main() {
+    require_root || return 1
+    while true; do
+        printf '\nVLESS+ENC 节点管理\n'
+        printf '1. 创建/重配节点\n2. 删除节点配置\n3. 显示节点信息\n'
+        printf '4. 停止服务\n5. 删除核心和 venc 命令\n6. 启动服务\n'
+        printf '7. 重启服务\n8. 查看服务日志\n9. 查看服务状态\n0. 退出\n'
+        read -r -p '请选择 [0-9]: ' choice || return 1
+        case "$choice" in
+            1) create_node || true ;;
+            2) delete_node || true ;;
+            3) show_node || true ;;
+            4) systemctl stop vless-rust || true ;;
+            5) uninstall_core || true ;;
+            6) systemctl start vless-rust || true ;;
+            7) systemctl restart vless-rust || true ;;
+            8) journalctl -u vless-rust -f --no-pager || true ;;
+            9) systemctl status vless-rust --no-pager || true ;;
+            0) return 0 ;;
+            *) fail '请输入菜单中的选项。' ;;
+        esac
+    done
+}
+
+main "$@"

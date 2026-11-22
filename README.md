@@ -19,7 +19,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main
 
 `--port` 默认从 `10000–60000` 随机选择空闲 TCP 端口；省略 `--host` 时自动检测 VPS 公网 IPv4/IPv6。认证可选 `x25519` 或 `mlkem768`，外观可选 `native`、`xorpub` 或 `random`，客户端设置必须相同。安装成功后终端会显示 VLESS+ENC 分享链接；链接也写入 `/root/vless-rust_link.txt`，配置位于 `/usr/local/etc/vless-rust/config.json`。请在云安全组和主机防火墙放行所选 TCP 端口。
 
-脚本安装少量下载工具，下载 GitHub Actions 已构建的 Linux 二进制并验证 SHA-256；服务器不安装 Rust/Cargo，也不进行编译。首次安装需要访问 GitHub Releases。Rust 构建由仓库 CI 使用固定工具链和 `Cargo.lock` 完成。
+脚本安装少量下载工具，下载 GitHub Actions 已构建的 Linux 二进制并验证 SHA-256；服务器不安装 Rust/Cargo，也不进行编译。首次安装需要访问 GitHub Releases。Rust 构建由仓库 CI 使用固定工具链和 `Cargo.lock` 完成。安装完成后可运行 `sudo venc` 打开管理菜单：1 新建/重配节点、2 删除节点配置、3 显示节点信息、4 停止服务、5 卸载核心和 `venc`、6 启动服务、7 重启服务、8 查看日志、9 查看状态。显示节点会从现有密钥配置重新生成客户端链接，不依赖安装时的终端输出。
 
 ## 服务管理
 

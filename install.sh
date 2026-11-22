@@ -139,7 +139,12 @@ expected=$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
     "$release_url/vless-rust-linux-${asset_arch}.sha256")
 actual=$(sha256sum "$binary" | awk '{print $1}')
 [[ "$expected" =~ ^[0-9a-f]{64}$ && "$actual" == "$expected" ]] || fail 'Prebuilt binary SHA-256 verification failed.'
-chmod 0755 "$binary"
+menu_script="$WORK_DIR/venc"
+curl --proto '=https' --tlsv1.2 -fL --retry 3 "$release_url/venc" -o "$menu_script"
+expected=$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$release_url/venc.sha256")
+actual=$(sha256sum "$menu_script" | awk '{print $1}')
+[[ "$expected" =~ ^[0-9a-f]{64}$ && "$actual" == "$expected" ]] || fail 'Management command SHA-256 verification failed.'
+chmod 0755 "$binary" "$menu_script"
 [[ "$("$binary" version)" == "vless-rust $CORE_VERSION reference $CORE_REFERENCE" ]] || fail 'Downloaded core version or protocol reference does not match the deployment pin.'
 
 config="$WORK_DIR/config.json"
@@ -161,6 +166,9 @@ link_tmp=$(mktemp /root/vless-rust_link.txt.tmp.XXXXXX)
 printf '%s\n' "$link" > "$link_tmp"
 chmod 0600 "$link_tmp"
 mv -Tf "$link_tmp" /root/vless-rust_link.txt
+install -m 0755 "$menu_script" /usr/local/bin/venc
+printf '%s\n' "$host" > "$WORK_DIR/public-host"
+install -m 0600 "$WORK_DIR/public-host" /usr/local/etc/vless-rust/public-host
 uuid=${link#vless://}
 uuid=${uuid%%@*}
 printf '\nVLESS+ENC configuration installed and active.\n'
