@@ -53,7 +53,9 @@ list_nodes() {
         i=$((i + 1)); port='?'; type='未知'
         if link=$(node_link "$id" 2>/dev/null); then
             port=$(link_port "$link"); type='VLESS+ENC'
-            [[ "$link" != *'security=reality&'* ]] || type='VLESS+ENC+Reality'
+            if [[ "$link" == *'security=reality&'* ]]; then type+=' + Reality'; fi
+            if [[ "$link" == *'flow=xtls-rprx-vision'* ]]; then type+=' + Vision'; fi
+            if [[ "$link" == *'pqv='* ]]; then type+=' + ML-DSA-65'; fi
         fi
         state=$(systemctl is-active "$(node_service "$id")" 2>/dev/null || true)
         printf '%s. %s | %s/TCP | %s | %s\n' "$i" "$id" "$port" "$type" "${state:-inactive}"
@@ -138,18 +140,25 @@ verify_service() {
 }
 create_node() {
     local type input port host name target id directory staged link service
-    local auth=${VENC_DEFAULT_AUTH:-x25519} mode=${VENC_DEFAULT_MODE:-native}
+    local auth=${VENC_DEFAULT_AUTH:-x25519} mode=${VENC_DEFAULT_MODE:-native} capabilities
     local -a options=()
     [[ -x "$CORE" && -f "$TEMPLATE" ]] || { fail '请先运行安装脚本安装核心及多节点服务模板。'; return 1; }
-    printf '\n1. VLESS + Encryption（无 Reality）\n2. VLESS + Encryption + Reality（实验性）\n0. 返回\n'
+    capabilities=$("$CORE" capabilities) || { fail '无法读取核心功能列表。'; return 1; }
+    printf '\n1. VLESS + Encryption（无 Reality）\n2. VLESS + Encryption + Reality + XTLS Vision（实验性，X25519）\n3. VLESS + Encryption + Reality + XTLS Vision（实验性，ML-KEM-768）\n0. 返回\n'
     read -r -p '请选择节点类型 [1]: ' type || return 1
     type=${type:-1}
     case "$type" in
         0) return 0 ;;
         1) ;;
         2)
-            [[ "$("$CORE" capabilities)" == *reality-experimental* ]] || { fail '当前核心不支持 Reality，请先更新核心。'; return 1; }
-            printf 'Reality 初版使用 TLS 1.3，不支持 Vision、ML-DSA-65 或目标站握手指纹复刻。\n'
+            [[ "$capabilities" == *reality-experimental* && "$capabilities" == *xtls-vision* ]] || { fail '当前核心不支持 Reality + Vision，请先更新核心。'; return 1; }
+            auth=x25519
+            options+=(--reality --vision)
+            ;;
+        3)
+            [[ "$capabilities" == *reality-experimental* && "$capabilities" == *xtls-vision* ]] || { fail '当前核心不支持 Reality + Vision，请先更新核心。'; return 1; }
+            auth=mlkem768
+            options+=(--reality --vision)
             ;;
         *) fail '无效的节点类型。'; return 1 ;;
     esac
@@ -164,11 +173,19 @@ create_node() {
         read -r -p '无法检测公网 IP，请输入公网 IP/域名: ' host || return 1
         [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || { fail '无效的公网地址。'; return 1; }
     fi
-    if [[ "$type" == 2 ]]; then
-        read -r -p 'Reality SNI/目标域名 [www.microsoft.com]: ' name || return 1
-        name=${name:-www.microsoft.com}
-        target=${VENC_REALITY_TARGET:-$name:443}
-        options+=(--reality --server-name "$name" --target "$target")
+    if [[ "$type" == 2 || "$type" == 3 ]]; then
+        read -r -p 'REALITY SNI [www.nvidia.com]: ' name || return 1
+        name=${name:-www.nvidia.com}
+        read -r -p 'REALITY 目标 HOST:PORT [www.nvidia.com:443]: ' target || return 1
+        target=${target:-${VENC_REALITY_TARGET:-www.nvidia.com:443}}
+        options+=(--server-name "$name" --target "$target")
+        read -r -p '启用可选 ML-DSA-65 证书证明？[y/N]: ' input || return 1
+        case "$input" in
+            y|Y|yes|YES)
+                [[ "$capabilities" == *reality-mldsa65* ]] || { fail '当前核心不支持 REALITY ML-DSA-65，请先更新核心。'; return 1; }
+                options+=(--mldsa65)
+                ;;
+        esac
     fi
     install -d -m 0750 -o root -g vless-rust "$NODES_DIR" || return 1
     staged=$(mktemp -d "$NODES_DIR/.create.XXXXXX") || return 1
@@ -312,7 +329,7 @@ migrate_legacy_node() {
         return 1
     fi
     systemctl reset-failed vless-rust >/dev/null 2>&1 || true
-    printf '\n旧版节点已迁移至 %s，UUID、端口、Encryption/Reality 凭据均保留。\n' "$destination"
+    printf '\n旧版节点已迁移至 %s，UUID、端口、Encryption/Reality/ML-DSA-65/Vision 配置均保留。\n' "$destination"
     printf '新服务：%s；运行状态：%s；端口：%s/TCP。\n' "$service" "$(if [[ "$old_active" == true ]]; then printf 'active'; else printf 'inactive'; fi)" "$port"
 }
 update_and_migrate() {

@@ -1,8 +1,8 @@
 # VLESS Encryption Rust
 
-独立 Rust 实现的 VLESS Encryption 核心，协议参照 Xray-core `v26.11.9`。支持 TCP、UDP、Mux、XUDP，以及**实验性的 Reality + VLESS Encryption**；不启动或嵌入 Go Xray。客户端必须支持 VLESS Encryption 的 `encryption` 参数。
+独立 Rust 实现的 VLESS Encryption 核心，协议参照 Xray-core `v26.11.9`。支持 TCP、UDP、Mux、XUDP；另提供**实验性的 XTLS Vision（直连 TCP）**和 **REALITY + VLESS Encryption**，REALITY 可选 ML-DSA-65 证书证明。不启动或嵌入 Go Xray。客户端必须支持 VLESS Encryption 的 `encryption` 参数。
 
-> Reality 初版使用 rustls TLS 1.3，实现 ClientHello 认证、证书证明和未认证连接的目标站转发。**未实现参考服务端的目标站 ServerHello / 记录指纹复刻**，不能视为与官方 Reality 等效的流量伪装或抗探测实现。暂不支持 Vision、ML-DSA-65、普通 TLS 节点和其他传输。
+> 当前公开菜单提供三类节点：普通 Encryption、REALITY + Vision（X25519 Encryption 认证）、REALITY + Vision（ML-KEM-768 Encryption 认证）。后两类均可选择启用额外 ML-DSA-65 证明（默认关闭）。组合已在 Windows localhost 对 Xray-core v26.11.9 完成 30 个官方客户端变体互通，并在 Debian 13 上通过 30 组组合互通及三种 systemd 节点访问 `www.nvidia.com`。ML-DSA-65 另覆盖正确 / 错误验证密钥。Vision 日志只观测到 downlink Direct 转换，uplink Direct 与完整 TLS 指纹等价并未证明。REALITY 仅在已测 TLS 目标形态下复刻 ServerHello / 初始记录特征，不是完整指纹等价、抗探测保证或安全审计。ML-DSA-65 大证书可能导致部分目标的记录长度无法匹配。其他公网目标、长时运行和独立安全审计仍待验证。
 
 ## 一条命令安装，菜单中创建节点
 
@@ -28,12 +28,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main
 0. 退出
 ```
 
-选择 **1 创建节点** 后，再选择：
-
 - `1`：VLESS + Encryption，无 Reality；回车默认选择此类型。
-- `2`：VLESS + Encryption + Reality，实验性。
+- `2`：VLESS + Encryption + Reality + XTLS Vision，X25519 Encryption 认证。
+- `3`：VLESS + Encryption + Reality + XTLS Vision，ML-KEM-768 Encryption 认证。
 
-输入所需 TCP 端口；回车从 `10000–60000` 随机选择未占用、也未分配给其他节点的端口。公网 IP 自动检测，UUID、Encryption 密钥自动生成；Reality 私钥、short ID 也自动生成，只需额外确认 SNI / 目标域名（默认 `www.microsoft.com`，目标端口 `443`）。请使用服务器可访问、支持 TLS 1.3 的目标站，并保持服务器时间同步。
+类型 2 / 3 可选择添加 ML-DSA-65 额外证书证明（默认关闭；启用时随机生成 seed，链接中的 `pqv` 公钥由 seed 派生）。TLS 的 REALITY 密钥、short ID、SpiderX 路径均由核心随机生成；公开 `pbk` 是随机生成私钥对应的 X25519 公钥，私钥不会放进链接。
+
+类型 2 / 3 的 SNI 默认 `www.nvidia.com`，目标默认 `www.nvidia.com:443`；两项可单独输入自定义值。目标必须能从服务器访问且符合 REALITY TLS 1.3 探测支持范围。
 
 每次创建都是**独立节点、独立配置和独立 systemd 服务**。旧节点的端口、UUID、密钥、链接和运行状态保持不变。启动失败只撤销新节点。停止的节点仍保留其端口分配；要释放分配，请删除该节点。
 
@@ -43,14 +44,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main
 sudo venc
 ```
 
-可选安装参数作为**本次菜单会话中新节点的默认值**，不会直接创建节点，也不改变旧节点：
+安装参数 `--port`、`--host`、`--mode` 作为本次菜单会话中新节点的默认值；`--auth` 默认值只作用于普通类型 1（x25519 / mlkem768），Reality + Vision 类型 2 / 3 固定选择各自标示的认证模式。它们不会直接创建节点或改变旧节点。
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main/install.sh) \
   --host YOUR_SERVER_IP --port 18443 --auth x25519 --mode native
 ```
 
-认证支持 `x25519` / `mlkem768`；流量外观支持 `native` / `xorpub` / `random`。仅安装或更新、不进入菜单：加 `--no-menu`。没有交互输入时，安装后展示菜单并退出，不会自动创建节点。
+外观 `--mode` 支持 `native` / `xorpub` / `random`。仅安装或更新、不进入菜单：加 `--no-menu`。没有交互输入时，安装后展示菜单并退出，不会自动创建节点。
 
 ## 多节点文件和服务
 
@@ -90,6 +91,9 @@ python3 ../tests/regression.py
 python3 tools/fetch_reference.py
 python3 tools/interop.py --rust target/release/vless-rust
 python3 tools/interop.py --rust target/release/vless-rust --reality
+python3 tools/interop.py --rust target/release/vless-rust --reality --vision
+python3 tools/interop.py --rust target/release/vless-rust --reality --vision --mldsa65
+python3 tools/regression.py
 ```
 
-核心尚未经过独立安全审计；Reality 是初版实验实现。Linux systemd 实机回滚、公网和长时间运行仍需验证。完整范围及配置见 [rust-core/README.md](rust-core/README.md)，测试记录见 [rust-core/VALIDATION.md](rust-core/VALIDATION.md)。发布 `vless-rust-v0.2.0` 的二进制和部署包后，远程一键安装入口才能使用本次更新。
+互通测试使用固定的 Xray-core v26.11.9。Windows localhost 和 Debian 13 / `www.nvidia.com` 的结果不代表其他公网目标兼容或完整 fingerprint parity。核心尚未经过独立安全审计；完整部署与验证范围见 [rust-core/README.md](rust-core/README.md) 和 [rust-core/VALIDATION.md](rust-core/VALIDATION.md)。远程一键安装入口在发布 `vless-rust-v0.3.0` 二进制和部署包后才会包含本次改动。

@@ -13,6 +13,7 @@ mod handshake;
 mod mux;
 mod reality;
 mod record;
+mod vision;
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -84,17 +85,27 @@ fn subscription(config: &Config, host: &str) -> Result<String> {
     };
     let uuid = config.users.first().context("missing user UUID")?;
     let security = if let Some(reality) = &config.reality {
+        let verify = reality
+            .mldsa65_public_key()?
+            .map(|key| format!("&pqv={}", URL_SAFE_NO_PAD.encode(key)))
+            .unwrap_or_default();
         format!(
-            "reality&sni={}&fp=chrome&pbk={}&sid={}&spx=%2F",
+            "reality&sni={}&fp=chrome&pbk={}&sid={}&spx=%2F{}{verify}",
             reality.server_name,
             reality.public_key()?,
-            reality.short_id
+            reality.short_id,
+            &reality.spider_x[1..]
         )
     } else {
         "none".to_owned()
     };
+    let flow = if config.vision {
+        "&flow=xtls-rprx-vision"
+    } else {
+        ""
+    };
     Ok(format!(
-        "vless://{uuid}@{host}:{}?encryption={encryption}&security={security}&type=tcp#VLESS-Rust-{}",
+        "vless://{uuid}@{host}:{}?encryption={encryption}&security={security}&type=tcp{flow}#VLESS-Rust-{}",
         config.listen.port(),
         config.listen.port()
     ))
@@ -273,13 +284,13 @@ fn import_xray_config(
             .all(|k| ["users", "clients", "decryption", "flow"].contains(&k.as_str())),
         "Xray VLESS settings have unsupported extensions"
     );
+    let default_flow = settings
+        .get("flow")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     ensure!(
-        settings
-            .get("flow")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .is_empty(),
-        "Vision flow cannot be migrated to the plain Rust core"
+        default_flow.is_empty() || default_flow == "xtls-rprx-vision",
+        "unsupported VLESS flow for Rust migration"
     );
     let users = settings
         .get("clients")
@@ -291,6 +302,7 @@ fn import_xray_config(
         "Xray user count must be 1..4096"
     );
     let mut migrated_users = Vec::with_capacity(users.len());
+    let mut imported_flow: Option<&str> = None;
     for user in users {
         let user = user.as_object().context("invalid Xray VLESS user")?;
         ensure!(
@@ -298,13 +310,22 @@ fn import_xray_config(
                 .all(|k| ["id", "flow", "email", "level"].contains(&k.as_str())),
             "Xray VLESS user has unsupported extensions"
         );
+        let user_flow = user
+            .get("flow")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(default_flow);
         ensure!(
-            user.get("flow")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .is_empty(),
-            "Vision flow cannot be migrated to the plain Rust core"
+            user_flow.is_empty() || user_flow == "xtls-rprx-vision",
+            "unsupported VLESS user flow for Rust migration"
         );
+        if let Some(previous) = imported_flow {
+            ensure!(
+                previous == user_flow,
+                "mixed per-user VLESS flows cannot be represented by this Rust node"
+            );
+        } else {
+            imported_flow = Some(user_flow);
+        }
         ensure!(
             user.get("level")
                 .and_then(serde_json::Value::as_u64)
@@ -368,6 +389,7 @@ fn import_xray_config(
         listen: SocketAddr::new(listen_host, port.unwrap_or(original_port as u16)),
         users: migrated_users,
         decryption: original_decryption.to_owned(),
+        vision: imported_flow.unwrap_or(default_flow) == "xtls-rprx-vision",
         reality: None,
         limits: Limits::default(),
         log_connections: false,
@@ -392,7 +414,7 @@ async fn serve(config: Config) -> Result<()> {
     let reality = config
         .reality
         .clone()
-        .map(|c| reality::Server::new(c, config.limits.max_sessions))
+        .map(|c| reality::Server::new(c, config.limits.max_sessions, config.listen))
         .transpose()?
         .map(Arc::new);
     let server = Arc::new(handshake::Server::new(
@@ -432,6 +454,7 @@ async fn serve(config: Config) -> Result<()> {
     let total = Arc::new(AtomicU64::new(0));
     let errors = Arc::new(AtomicU64::new(0));
     let resumes = Arc::new(AtomicU64::new(0));
+    let retries = Arc::new(AtomicU64::new(0));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -439,14 +462,14 @@ async fn serve(config: Config) -> Result<()> {
             r = &mut shutdown => { r?; break; },
             _ = maintenance.tick() => {
                 server.prune();
-                eprintln!("stats active={} accepted={} errors={} resumed={}", config.limits.max_connections - clients.available_permits(), total.load(Ordering::Relaxed), errors.load(Ordering::Relaxed), resumes.load(Ordering::Relaxed));
+                eprintln!("stats active={} accepted={} errors={} resumed={} retry={}", config.limits.max_connections - clients.available_permits(), total.load(Ordering::Relaxed), errors.load(Ordering::Relaxed), resumes.load(Ordering::Relaxed), retries.load(Ordering::Relaxed));
             },
             r = tasks.join_next(), if !tasks.is_empty() => { if let Some(Err(error)) = r { eprintln!("connection task failed: {error}"); } },
             result = listener.accept() => {
                 let (socket, peer) = match result { Ok(pair) => pair, Err(e) => { eprintln!("accept error: {e}"); tokio::time::sleep(Duration::from_millis(100)).await; continue; } };
                 let Ok(client_permit) = clients.clone().try_acquire_owned() else { drop(socket); continue; };
                 let server = server.clone(); let config = config.clone(); let reality = reality.clone(); let handshakes = handshakes.clone(); let outbounds = outbounds.clone();
-                let errors = errors.clone(); let resumes = resumes.clone();
+                let errors = errors.clone(); let resumes = resumes.clone(); let retries = retries.clone();
                 let id = total.fetch_add(1, Ordering::Relaxed) + 1;
                 tasks.spawn(async move {
                     let _client = client_permit;
@@ -454,7 +477,7 @@ async fn serve(config: Config) -> Result<()> {
                         forward::configure_tcp(&socket, &config.limits).context("configure inbound TCP")?;
                         let request = timeout(Duration::from_secs(config.limits.handshake_timeout_secs), async {
                             let permit = handshakes.acquire_owned().await?;
-                            let (mut reader, writer, resumed) = if let Some(reality) = reality {
+                            let (mut reader, mut writer, resumed) = if let Some(reality) = reality {
                                 let Some(socket) = reality.accept(socket).await? else { return Ok(None); };
                                 if config.log_connections {
                                     eprintln!("connection={id} reality_tls_group={:?}", socket.get_ref().1.negotiated_key_exchange_group().map(|g| g.name()));
@@ -464,23 +487,43 @@ async fn serve(config: Config) -> Result<()> {
                                 server.handshake(socket).await.context("encryption handshake")?
                             };
                             let req = forward::request(&mut reader, &config).await.context("VLESS request")?;
+                            let vision_state = if config.vision {
+                                let vision = vision::SharedState::new();
+                                reader.enable_vision(req.user_id, vision.clone())?;
+                                writer.enable_vision(req.user_id, vision.clone())?;
+                                Some(vision)
+                            } else {
+                                None
+                            };
                             drop(permit);
-                            Ok::<_, anyhow::Error>(Some(((reader, writer, resumed), req)))
+                            Ok::<_, anyhow::Error>(Some(((reader, writer, resumed, vision_state), req)))
                         }).await.context("handshake timeout")??;
-                        let Some(((reader, writer, resumed), req)) = request else { return Ok(()); };
+                        let Some(((reader, writer, resumed, vision_state), req)) = request else { return Ok(()); };
                         if resumed { resumes.fetch_add(1, Ordering::Relaxed); }
                         if config.log_connections { eprintln!("connection={id} peer={peer} handshake={} cipher={:?}", if resumed { "0rtt" } else { "1rtt" }, reader.algorithm()); }
                         let activity = forward::Activity::new();
-                        if req.command == 3 {
+                        let result = if req.command == 3 {
                             mux::serve(reader, writer, &config.limits, activity, outbounds).await
                         } else {
                             let _outbound = outbounds.try_acquire_owned().context("outbound connection limit")?;
                             let target = req.target.context("missing destination")?;
                             if req.command == 1 { forward::tcp(reader, writer, target, &config.limits, activity).await }
                             else { forward::udp(reader, writer, target, &config.limits, activity).await }
+                        };
+                        if config.log_connections && let Some(vision) = vision_state {
+                            eprintln!("connection={id} vision_direct_transitions={} vision_direct_uplink={} vision_direct_downlink={}", vision.direct_transitions(), vision.direct_uplink(), vision.direct_downlink());
                         }
+                        result
                     }.await;
-                    if let Err(error) = result { errors.fetch_add(1, Ordering::Relaxed); eprintln!("connection={id} peer={peer} error={error:#}"); }
+                    if let Err(error) = result {
+                        if handshake::is_retry_required(&error) {
+                            retries.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("connection={id} peer={peer} event=0rtt_retry reason={error:#}");
+                        } else {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("connection={id} peer={peer} error={error:#}");
+                        }
+                    }
                 });
             }
         }
@@ -504,7 +547,7 @@ fn main() -> Result<()> {
     let command = args.first().map(String::as_str).unwrap_or("help");
     if ["help", "--help", "-h"].contains(&command) {
         println!(
-            "vless-rust {} (reference {REFERENCE})\n\nCommands:\n  init --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--auth x25519|mlkem768] [--mode native|xorpub|random] [--reality --server-name DOMAIN [--target HOST:PORT]]\n  configure --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--rekey] [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  link --config FILE --host HOST\n  keygen [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  check --config FILE\n  run --config FILE\n  version\n  capabilities\n\nSupports VLESS Encryption, TCP/UDP and XUDP, and experimental REALITY over TLS 1.3. Vision, ML-DSA-65 and live-target handshake camouflage are not supported.\nConfiguration contains private keys: keep it private.",
+            "vless-rust {} (reference {REFERENCE})\n\nCommands:\n  init --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--auth x25519|mlkem768] [--mode native|xorpub|random] [--vision] [--reality [--server-name DOMAIN] [--target HOST:PORT] [--mldsa65]]\n  configure --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--rekey] [--vision|--no-vision] [--mldsa65|--no-mldsa65] [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  link --config FILE --host HOST\n  keygen [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  check --config FILE\n  run --config FILE\n  version\n  capabilities\n\nSupports VLESS Encryption and experimental REALITY + XTLS Vision over direct TCP with optional ML-DSA-65 proof. Default REALITY SNI/target: www.nvidia.com / www.nvidia.com:443. Target-derived shaping is limited and not full fingerprint replication.\nConfiguration contains private keys: keep them private.",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -519,7 +562,7 @@ fn main() -> Result<()> {
     }
     if command == "capabilities" {
         ensure!(args.len() == 1, "unexpected capabilities arguments");
-        println!("vless-encryption reality-experimental");
+        println!("vless-encryption xtls-vision reality-experimental reality-mldsa65");
         return Ok(());
     }
     let mut path = None;
@@ -532,6 +575,9 @@ fn main() -> Result<()> {
     let mut mode = None;
     let mut rekey = false;
     let mut use_reality = false;
+    let mut vision_setting = None;
+    let mut mldsa65_setting = None;
+    let mut mldsa65 = false;
     let mut server_name = None;
     let mut target = None;
     let mut i = 1;
@@ -544,6 +590,29 @@ fn main() -> Result<()> {
         }
         if command == "init" && option == "--reality" {
             use_reality = true;
+            i += 1;
+            continue;
+        }
+        if matches!(
+            (command, option),
+            ("init", "--vision") | ("configure", "--vision")
+        ) {
+            vision_setting = Some(true);
+            i += 1;
+            continue;
+        }
+        if command == "init" && option == "--mldsa65" {
+            mldsa65 = true;
+            i += 1;
+            continue;
+        }
+        if command == "configure" && matches!(option, "--mldsa65" | "--no-mldsa65") {
+            mldsa65_setting = Some(option == "--mldsa65");
+            i += 1;
+            continue;
+        }
+        if command == "configure" && option == "--no-vision" {
+            vision_setting = Some(false);
             i += 1;
             continue;
         }
@@ -605,20 +674,23 @@ fn main() -> Result<()> {
             );
             let (decryption, _) = keypair(auth.unwrap_or("x25519"), mode.unwrap_or("native"))?;
             let uuid = uuid.unwrap_or_else(Uuid::new_v4);
+            ensure!(!mldsa65 || use_reality, "--mldsa65 requires --reality");
             let config = Config {
                 listen: SocketAddr::new(listen_host.unwrap_or("::".parse()?), port.unwrap_or(443)),
                 users: vec![uuid],
                 decryption,
+                vision: vision_setting.unwrap_or(false),
                 reality: if use_reality {
-                    let name = server_name.context("--server-name required with --reality")?;
-                    Some(reality::RealityConfig::generate(
-                        name.clone(),
-                        target.unwrap_or_else(|| format!("{name}:443")),
+                    let name = server_name.unwrap_or_else(|| "www.nvidia.com".to_owned());
+                    Some(reality::RealityConfig::generate_with_mldsa65(
+                        name,
+                        target.unwrap_or_else(|| "www.nvidia.com:443".to_owned()),
+                        mldsa65,
                     )?)
                 } else {
                     ensure!(
-                        server_name.is_none() && target.is_none(),
-                        "--server-name/--target require --reality"
+                        server_name.is_none() && target.is_none() && !mldsa65,
+                        "--server-name/--target/--mldsa65 require --reality"
                     );
                     None
                 },
@@ -664,6 +736,20 @@ fn main() -> Result<()> {
                 listen_host.unwrap_or(config.listen.ip()),
                 port.unwrap_or(config.listen.port()),
             );
+            if let Some(enabled) = vision_setting {
+                config.vision = enabled;
+            }
+            if let Some(enabled) = mldsa65_setting {
+                let reality = config
+                    .reality
+                    .as_mut()
+                    .context("--mldsa65/--no-mldsa65 requires a REALITY configuration")?;
+                if enabled {
+                    reality.enable_mldsa65()?;
+                } else {
+                    reality.disable_mldsa65();
+                }
+            }
             if let Some(uuid) = uuid {
                 *config.users.first_mut().context("missing user UUID")? = uuid;
             }
@@ -686,7 +772,7 @@ fn main() -> Result<()> {
             let config = Config::load(path)?;
             if command == "check" {
                 if let Some(reality) = config.reality.clone() {
-                    reality::Server::new(reality, config.limits.max_sessions)?;
+                    reality::Server::new(reality, config.limits.max_sessions, config.listen)?;
                 }
                 handshake::Server::new(
                     EncryptionConfig::parse(&config.decryption)?,

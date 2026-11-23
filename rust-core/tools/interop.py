@@ -1,12 +1,15 @@
 """Real Xray-core v26.11.9 client -> independent Rust server, localhost only."""
 import argparse
+import ast
 import concurrent.futures
 import contextlib
 import json
 import os
 import pathlib
+import re
 import socket
 import socketserver
+import ssl
 import struct
 import subprocess
 import tempfile
@@ -60,6 +63,19 @@ class UdpEcho(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
         sock.sendto(data, self.client_address)
+
+class TlsEcho(Echo):
+    context = None
+
+    def setup(self):
+        try:
+            self.request = self.context.wrap_socket(self.request, server_side=True)
+        except (OSError, ssl.SSLError):
+            self.handshake_failed = True
+
+    def handle(self):
+        if not getattr(self, "handshake_failed", False):
+            super().handle()
 
 class ThreadTcp(socketserver.ThreadingTCPServer):
     daemon_threads = True
@@ -131,6 +147,20 @@ def tcp_case(socks, target, domain=False, size=131071, ipv6=False):
         # SOCKS/Xray may close its own full duplex transport on SOCKS EOF.
         # Half-close is verified directly against the Rust forwarding layer.
 
+def tls_case(socks, target, size=8193):
+    context = ssl._create_unverified_context()
+    with socks_connect(socks, target) as raw, context.wrap_socket(raw, server_hostname="localhost") as secure:
+        payload = os.urandom(size)
+        secure.sendall(payload)
+        assert exact(secure, size) == payload
+
+def create_tls_certificate(directory):
+    key, cert = directory / "tls-key.pem", directory / "tls-cert.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", "/CN=localhost"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    return context
+
 def udp_case(socks, target, ipv6=False):
     control = socket.create_connection(("127.0.0.1", socks), timeout=10)
     control.settimeout(10)
@@ -168,21 +198,37 @@ def main():
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--relays-only", action="store_true")
     parser.add_argument("--reality", action="store_true", help="exercise experimental REALITY TLS 1.3 with the official client")
+    parser.add_argument("--mldsa65", action="store_true", help="verify REALITY's ML-DSA-65 certificate proof using the official client")
+    parser.add_argument("--vision", action="store_true", help="exercise XTLS Vision flow with the official client")
     parser.add_argument("--fingerprint", default="chrome", choices=("chrome", "firefox", "safari"), help="REALITY client TLS fingerprint")
+    parser.add_argument("--appearance", choices=("native", "xorpub", "random"), help="filter quick cases to an Encryption appearance")
     args = parser.parse_args()
+    if args.mldsa65 and not args.reality:
+        parser.error("--mldsa65 requires --reality")
     version = subprocess.check_output([str(args.reference), "version"], text=True, creationflags=CREATE_FLAGS)
     assert version.startswith("Xray 26.11.9 "), version
     output = ROOT / ".build/interop"
     output.mkdir(parents=True, exist_ok=True)
     report = []
-    with service(Echo) as target, service(UdpEcho, udp=True) as udp_target:
-        variants = [("x25519", "native", "aes", False)] if args.quick else [(a, m, c, mux) for a in ("x25519", "mlkem768") for m in ("native", "xorpub", "random") for c in ("aes", "chacha") for mux in (False, True)]
+    tls_context = None
+    if args.vision or args.reality:
+        certificate_directory = output / "vision-certificate"
+        certificate_directory.mkdir(exist_ok=True)
+        tls_context = create_tls_certificate(certificate_directory)
+        TlsEcho.context = tls_context
+    with service(Echo) as target, service(UdpEcho, udp=True) as udp_target, service(TlsEcho) as tls_target:
+        if args.quick:
+            quick_auth = ("x25519", "mlkem768") if args.reality and args.vision else ("x25519",)
+            quick_mux = (False, True) if args.reality and args.vision else (False,)
+            variants = [(auth, args.appearance or "native", "aes", mux) for auth in quick_auth for mux in quick_mux]
+        else:
+            variants = [(a, m, c, mux) for a in ("x25519", "mlkem768") for m in ("native", "xorpub", "random") for c in ("aes", "chacha") for mux in (False, True)]
         if not args.quick:
             variants += [(a, m, "aes", -1) for a in ("x25519", "mlkem768") for m in ("native", "xorpub", "random")]
         if args.relays_only:
             variants = [("relay8", m, c, False) for m in ("native", "xorpub", "random") for c in ("aes", "chacha")]
         for auth, mode, cipher, mux in variants:
-            label = f"{'reality-' + args.fingerprint + '-' if args.reality else ''}{auth}-{mode}-{cipher}-mux{int(mux)}"
+            label = f"{'vision-' if args.vision else ''}{'mldsa65-' if args.mldsa65 else ''}{'reality-' + args.fingerprint + '-' if args.reality else ''}{auth}-{mode}-{cipher}-mux{int(mux)}"
             with tempfile.TemporaryDirectory(dir=output) as directory:
                 d = pathlib.Path(directory)
                 if auth == "relay8":
@@ -193,15 +239,27 @@ def main():
                 node, socks = port(), port()
                 uid = str(uuid.uuid4())
                 config = {"listen": f"127.0.0.1:{node}", "users": [uid], "decryption": keys["decryption"], "log_connections": True, "limits": {"allow_private_destinations": True}}
+                if args.vision:
+                    config["vision"] = True
                 reality_link = None
                 if args.reality:
-                    reality_link = subprocess.check_output([str(args.rust), "init", "--config", str(d / "reality.json"), "--host", "127.0.0.1", "--reality", "--server-name", "example.com", "--target", f"127.0.0.1:{target}"], text=True, creationflags=CREATE_FLAGS).strip()
+                    reality_args = [str(args.rust), "init", "--config", str(d / "reality.json"), "--host", "127.0.0.1", "--reality", "--server-name", "example.com", "--target", f"127.0.0.1:{tls_target}"]
+                    if args.mldsa65:
+                        reality_args.append("--mldsa65")
+                    reality_link = subprocess.check_output(reality_args, text=True, creationflags=CREATE_FLAGS).strip()
                     config["reality"] = json.loads((d / "reality.json").read_text())["reality"]
                 (d / "server.json").write_text(json.dumps(config))
-                client = {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": socks, "protocol": "socks", "settings": {"udp": True}}], "outbounds": [{"protocol": "vless", "settings": {"address": "127.0.0.1", "port": node, "id": uid, "encryption": keys["encryption"]}, "streamSettings": {"method": "raw", "security": "none"}, "mux": {"enabled": mux, "concurrency": 8}}]}
+                user = {"id": uid, "encryption": keys["encryption"]}
+                if args.vision:
+                    user["flow"] = "xtls-rprx-vision"
+                client = {"log": {"loglevel": "debug" if args.vision else "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": socks, "protocol": "socks", "settings": {"udp": True}}], "outbounds": [{"protocol": "vless", "settings": {"address": "127.0.0.1", "port": node, **user}, "streamSettings": {"method": "raw", "security": "none"}, "mux": {"enabled": mux, "concurrency": 8}}]}
                 if reality_link:
                     query = urllib.parse.parse_qs(urllib.parse.urlsplit(reality_link).query)
-                    client["outbounds"][0]["streamSettings"].update({"security": "reality", "realitySettings": {"serverName": "example.com", "fingerprint": args.fingerprint, "publicKey": query["pbk"][0], "shortId": query["sid"][0], "spiderX": "/"}})
+                    reality_settings = {"serverName": "example.com", "fingerprint": args.fingerprint, "publicKey": query["pbk"][0], "shortId": query["sid"][0], "spiderX": query.get("spx", ["/"])[0]}
+                    if args.mldsa65:
+                        reality_settings["mldsa65Verify"] = query["pqv"][0]
+                        reality_settings["show"] = True
+                    client["outbounds"][0]["streamSettings"].update({"security": "reality", "realitySettings": reality_settings})
                 if mux == -1:
                     client["outbounds"][0]["mux"] = {"enabled": False, "concurrency": -1, "xudpConcurrency": -1}
                 (d / "client.json").write_text(json.dumps(client))
@@ -215,6 +273,8 @@ def main():
                         wait_port(socks, client_process)
                         try:
                             tcp_case(socks, target)
+                            if args.vision:
+                                tls_case(socks, tls_target)
                             tcp_case(socks, target, domain=True)
                             udp_case(socks, udp_target)
                             if auth == "x25519" and mode == "native" and cipher == "aes":
@@ -227,14 +287,73 @@ def main():
                             print(server_log.read_text(errors="replace"))
                             print(client_log.read_text(errors="replace"))
                             raise
+                    if args.mldsa65:
+                        bad_client = json.loads(json.dumps(client))
+                        bad_socks = port()
+                        bad_client["inbounds"][0]["port"] = bad_socks
+                        bad_settings = bad_client["outbounds"][0]["streamSettings"]["realitySettings"]
+                        bad_config = d / "client-bad-mldsa65.json"
+                        bad_link = subprocess.check_output(
+                            [str(args.rust), "init", "--config", str(d / "bad-reality.json"), "--host", "127.0.0.1", "--reality", "--server-name", "example.com", "--target", f"127.0.0.1:{tls_target}", "--mldsa65"],
+                            text=True,
+                            creationflags=CREATE_FLAGS,
+                        ).strip()
+                        bad_public_key = urllib.parse.parse_qs(urllib.parse.urlsplit(bad_link).query)["pqv"][0]
+                        bad_settings["mldsa65Verify"] = bad_public_key
+                        bad_config.write_text(json.dumps(bad_client))
+                        bad_log = output / f"{label}-bad-key-client.log"
+                        with process(args.reference, bad_config, bad_log, environment) as bad_process:
+                            wait_port(bad_socks, bad_process)
+                            bad_request_succeeded = False
+                            try:
+                                with socks_connect(bad_socks, target) as bad_stream:
+                                    payload = b"bad ML-DSA verification key"
+                                    bad_stream.sendall(payload)
+                                    bad_stream.settimeout(2)
+                                    bad_request_succeeded = bad_stream.recv(len(payload)) == payload
+                            except (AssertionError, EOFError, OSError, TimeoutError):
+                                pass
+                        bad_output = bad_log.read_text(errors="replace")
+                        assert "is using ML-DSA-65 for cert's extra verification: true" in bad_output, bad_output
+                        assert "uConn.Verified: true" not in bad_output, bad_output
+                        assert "REALITY TLS handshake: received fatal alert: BadCertificate" in server_log.read_text(errors="replace"), "wrong ML-DSA verification key was not rejected by TLS CertificateVerify handling"
+                        assert not bad_request_succeeded, "invalid ML-DSA verification key unexpectedly opened a proxy stream"
                 log = server_log.read_text(errors="replace")
                 if args.reality:
                     assert "reality_tls_group=" in log, "REALITY TLS handshake was not exercised"
+                    fingerprint_lines = re.findall(
+                        r"reality_fingerprint sni_ack=(true|false) server_hello=(\d+) target_records=(\[[^]]*\]) server_records=(\[[^]]*\]) server_hello_match=(true|false)",
+                        log,
+                    )
+                    assert fingerprint_lines, "live target fingerprint capture was not exercised"
+                    for target_sni_ack, server_hello_len, target_records_text, server_records_text, server_hello_match in fingerprint_lines:
+                        target_records = ast.literal_eval(target_records_text)
+                        server_records = ast.literal_eval(server_records_text)
+                        assert target_sni_ack == "false", "local OpenSSL target SNI profile changed"
+                        assert server_hello_match == "true", "ServerHello was not target-derived"
+                        assert server_records[:2] == [int(server_hello_len), 6], server_records
+                        if not args.mldsa65:
+                            assert server_records == [int(server_hello_len), 6, *target_records], (target_records, server_records)
+                        else:
+                            assert len(server_records) == len(target_records) + 2, (target_records, server_records)
+                    if args.mldsa65:
+                        client_output = client_log.read_text(errors="replace")
+                        assert "is using ML-DSA-65 for cert's extra verification: true" in client_output, client_output
+                        assert "uConn.Verified: true" in client_output, client_output
+                vision_counts = (0, 0)
+                if args.vision:
+                    vision_lines = re.findall(
+                        r"vision_direct_transitions=(\d+) vision_direct_uplink=(\d+) vision_direct_downlink=(\d+)",
+                        log,
+                    )
+                    assert vision_lines, "Vision direct-transition diagnostics were not emitted"
+                    vision_counts = tuple(sum(int(line[index]) for line in vision_lines) for index in (1, 2))
+                    assert sum(vision_counts) > 0 or mux or mode == "random", "TLS echo did not exercise an expected Vision direct transition"
                 expected = "Aes" if cipher == "aes" else "ChaCha"
                 assert f"cipher={expected}" in log, log
                 if mux is False or mux == -1:
                     assert "handshake=0rtt" in log, "0-RTT resumption was not exercised"
-                report.append({"case": label, "result": "passed", "cipher_verified": expected, "resumption_verified": mux is False or mux == -1})
+                report.append({"case": label, "result": "passed", "cipher_verified": expected, "resumption_verified": mux is False or mux == -1, "target_server_hello_verified": args.reality, "target_record_lengths_verified": args.reality and not args.mldsa65, "vision_direct_uplink_transitions": vision_counts[0] if args.vision else None, "vision_direct_downlink_transitions": vision_counts[1] if args.vision else None})
                 print(f"PASS {label}", flush=True)
     (output / ("reality-" + args.fingerprint + "-results.json" if args.reality else "relay-results.json" if args.relays_only else "results.json")).write_text(json.dumps(report, indent=2) + "\n")
     print(f"{len(report)} official client variants passed")

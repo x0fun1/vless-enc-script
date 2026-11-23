@@ -105,6 +105,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub users: Vec<Uuid>,
     pub decryption: String,
+    #[serde(default)]
+    pub vision: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality: Option<crate::reality::RealityConfig>,
     #[serde(default)]

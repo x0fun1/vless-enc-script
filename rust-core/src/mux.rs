@@ -258,7 +258,7 @@ pub async fn serve(
     activity: Arc<Activity>,
     budget: Arc<Semaphore>,
 ) -> Result<()> {
-    writer.write_all(&[0, 0]).await?;
+    writer.write_response_header().await?;
     let (out, mut outgoing) = mpsc::channel::<Zeroizing<Vec<u8>>>(2);
     let mut tasks = JoinSet::new();
     let mut streams: HashMap<u16, Stream> = HashMap::new();

@@ -1,4 +1,5 @@
 """CLI, migration and real socket resource/authorization regressions."""
+import base64
 import contextlib
 import json
 import os
@@ -35,6 +36,23 @@ class Regression(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn(self.keys["decryption"], result.stderr)
 
+    def test_vision_opt_in_and_toggle_preserve_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "config.json"
+            link = subprocess.check_output([str(RUST), "init", "--config", str(path), "--host", "example.com", "--vision"], text=True, creationflags=CREATE_FLAGS).strip()
+            created = json.loads(path.read_text())
+            self.assertTrue(created["vision"])
+            self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)["flow"], ["xtls-rprx-vision"])
+            credentials = (created["users"], created["decryption"])
+            plain_link = subprocess.check_output([str(RUST), "configure", "--config", str(path), "--host", "example.com", "--no-vision"], text=True, creationflags=CREATE_FLAGS).strip()
+            plain = json.loads(path.read_text())
+            self.assertFalse(plain["vision"])
+            self.assertNotIn("flow", urllib.parse.parse_qs(urllib.parse.urlsplit(plain_link).query))
+            self.assertEqual((plain["users"], plain["decryption"]), credentials)
+            vision_link = subprocess.check_output([str(RUST), "configure", "--config", str(path), "--host", "example.com", "--vision"], text=True, creationflags=CREATE_FLAGS).strip()
+            self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(vision_link).query)["flow"], ["xtls-rprx-vision"])
+            self.assertEqual((json.loads(path.read_text())["users"], json.loads(path.read_text())["decryption"]), credentials)
+
     def test_init_does_not_overwrite_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "config.json"
@@ -70,15 +88,16 @@ class Regression(unittest.TestCase):
     def test_reality_link_roundtrips_and_reconfiguration_preserves_keys(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "config.json"
-            created = subprocess.check_output([str(RUST), "init", "--config", str(path), "--host", "2001:db8::1", "--port", "18443", "--reality", "--server-name", "example.com"], text=True, creationflags=CREATE_FLAGS).strip()
+            created = subprocess.check_output([str(RUST), "init", "--config", str(path), "--host", "2001:db8::1", "--port", "18443", "--reality", "--server-name", "example.com", "--target", "origin.example.net:8443"], text=True, creationflags=CREATE_FLAGS).strip()
             config = json.loads(path.read_text())
-            self.assertEqual(config["reality"]["target"], "example.com:443")
+            self.assertEqual(config["reality"]["target"], "origin.example.net:8443")
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(created).query)
             self.assertEqual(query["security"], ["reality"])
             self.assertEqual(query["sni"], ["example.com"])
             self.assertEqual(query["sid"], [config["reality"]["short_id"]])
-            self.assertIn("encryption", query)
-            self.assertNotIn(config["reality"]["private_key"], created)
+            self.assertEqual(query["spx"], [config["reality"]["spider_x"]])
+            self.assertTrue(config["reality"]["spider_x"].startswith("/"))
+            self.assertNotIn("pqv", query)
             rebuilt = subprocess.check_output([str(RUST), "link", "--config", str(path), "--host", "2001:db8::1"], text=True, creationflags=CREATE_FLAGS).strip()
             self.assertEqual(created, rebuilt)
             subprocess.check_call([str(RUST), "configure", "--config", str(path), "--host", "example.com", "--port", "18444"], stdout=subprocess.DEVNULL, creationflags=CREATE_FLAGS)
@@ -101,6 +120,53 @@ class Regression(unittest.TestCase):
                         self.assertEqual(exact(s, len(payload)), payload)
                         s.sendall(b"follow-up")
                         self.assertEqual(exact(s, 9), b"follow-up")
+
+    def test_reality_mldsa65_is_opt_in_and_reconfiguration_preserves_reality_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "config.json"
+            link = subprocess.check_output([str(RUST), "init", "--config", str(path), "--host", "example.com", "--reality", "--server-name", "example.com"], text=True, creationflags=CREATE_FLAGS).strip()
+            original = json.loads(path.read_text())
+            original_reality = original["reality"]
+            self.assertNotIn("pqv", urllib.parse.parse_qs(urllib.parse.urlsplit(link).query))
+            link = subprocess.check_output([str(RUST), "configure", "--config", str(path), "--host", "example.com", "--mldsa65"], text=True, creationflags=CREATE_FLAGS).strip()
+            enabled = json.loads(path.read_text())
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)
+            self.assertEqual(len(query["pqv"][0]), 2603)  # 1952 bytes as unpadded base64url.
+            self.assertEqual(enabled["reality"]["private_key"], original_reality["private_key"])
+            self.assertEqual(enabled["reality"]["short_id"], original_reality["short_id"])
+            self.assertIn("mldsa65_seed", enabled["reality"])
+            subprocess.check_call([str(RUST), "check", "--config", str(path)], stdout=subprocess.DEVNULL, creationflags=CREATE_FLAGS)
+            link = subprocess.check_output([str(RUST), "configure", "--config", str(path), "--host", "example.com", "--no-mldsa65"], text=True, creationflags=CREATE_FLAGS).strip()
+            disabled = json.loads(path.read_text())
+            self.assertNotIn("mldsa65_seed", disabled["reality"])
+            self.assertNotIn("pqv", urllib.parse.parse_qs(urllib.parse.urlsplit(link).query))
+            self.assertEqual(disabled["reality"]["private_key"], original_reality["private_key"])
+
+    def test_reality_vision_combinations_use_requested_encryption_auth_and_defaults(self):
+        spider_paths = []
+        for auth in ("x25519", "mlkem768"):
+            with self.subTest(auth=auth), tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "config.json"
+                link = subprocess.check_output(
+                    [str(RUST), "init", "--config", str(path), "--host", "example.com", "--reality", "--vision", "--auth", auth],
+                    text=True,
+                    creationflags=CREATE_FLAGS,
+                ).strip()
+                config = json.loads(path.read_text())
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)
+                spider_paths.append(config["reality"]["spider_x"])
+                self.assertTrue(config["vision"])
+                self.assertEqual(config["reality"]["server_name"], "www.nvidia.com")
+                self.assertEqual(config["reality"]["target"], "www.nvidia.com:443")
+                self.assertFalse(config["reality"].get("mldsa65_seed"))
+                self.assertEqual(query["flow"], ["xtls-rprx-vision"])
+                self.assertEqual(query["sni"], ["www.nvidia.com"])
+                self.assertNotIn("pqv", query)
+                encoded_secret = config["decryption"].split(".")[3]
+                decoded_secret = base64.urlsafe_b64decode(encoded_secret + "=" * (-len(encoded_secret) % 4))
+                self.assertEqual(len(decoded_secret), 32 if auth == "x25519" else 64)
+                subprocess.check_call([str(RUST), "check", "--config", str(path)], stdout=subprocess.DEVNULL, creationflags=CREATE_FLAGS)
+        self.assertEqual(len(set(spider_paths)), 2)
 
     def test_configure_preserves_keys_until_explicit_rekey(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,12 +191,16 @@ class Regression(unittest.TestCase):
         self.assertEqual(migrated["users"], [uid])
         self.assertEqual(migrated["decryption"], self.keys["decryption"])
         self.assertEqual(migrated["listen"], "[::]:443")
-        for mutation in ("reality", "flow", "routing"):
+        vision_value = json.loads(json.dumps(value))
+        vision_value["inbounds"][0]["settings"]["users"][0]["flow"] = "xtls-rprx-vision"
+        migrated_vision = convert(vision_value)
+        self.assertTrue(migrated_vision["vision"])
+        for mutation in ("reality", "unsupported-flow", "routing"):
             altered = json.loads(json.dumps(value))
             if mutation == "reality":
                 altered["inbounds"][0]["streamSettings"]["security"] = "reality"
-            elif mutation == "flow":
-                altered["inbounds"][0]["settings"]["users"][0]["flow"] = "xtls-rprx-vision"
+            elif mutation == "unsupported-flow":
+                altered["inbounds"][0]["settings"]["users"][0]["flow"] = "unsupported-flow"
             else:
                 altered["routing"] = {"rules": []}
             with self.assertRaises(ValueError):

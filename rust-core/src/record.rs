@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Record framing, counters and rekeying follow Xray-core v26.11.9 common.go.
 use crate::crypto::{Aead, HeaderMask, mask_header};
+use crate::vision::{Decoder as VisionDecoder, Encoder as VisionEncoder, SharedState};
 use anyhow::{Result, ensure};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -9,6 +10,19 @@ use zeroize::Zeroizing;
 type Secret = Arc<Zeroizing<Vec<u8>>>;
 pub const RECORD_PAYLOAD: usize = 8192;
 
+fn direct_record_length(header: &[u8; 5]) -> Result<usize> {
+    ensure!(
+        header[..3] == [23, 3, 3],
+        "invalid TLS record header after XTLS Vision Direct transition"
+    );
+    let length = u16::from_be_bytes([header[3], header[4]]) as usize;
+    ensure!(
+        (17..=16640).contains(&length),
+        "invalid TLS record length after XTLS Vision Direct transition"
+    );
+    Ok(length)
+}
+
 pub struct Reader {
     socket: Box<dyn AsyncRead + Unpin + Send>,
     cipher: Aead,
@@ -16,6 +30,11 @@ pub struct Reader {
     secret: Secret,
     buffer: Zeroizing<Vec<u8>>,
     offset: usize,
+    vision: Option<VisionDecoder>,
+    direct_header: [u8; 5],
+    direct_header_len: usize,
+    direct_header_offset: usize,
+    direct_body_remaining: usize,
 }
 
 impl Reader {
@@ -35,14 +54,88 @@ impl Reader {
             secret,
             buffer: Zeroizing::new(Vec::with_capacity(RECORD_PAYLOAD + 16)),
             offset: 0,
+            vision: None,
+            direct_header: [0; 5],
+            direct_header_len: 0,
+            direct_header_offset: 0,
+            direct_body_remaining: 0,
         }
+    }
+
+    pub fn enable_vision(&mut self, uuid: [u8; 16], state: SharedState) -> Result<()> {
+        ensure!(self.vision.is_none(), "Vision already enabled");
+        let pending = self.buffer[self.offset..].to_vec();
+        let mut decoder = VisionDecoder::new(uuid, state, true);
+        let decoded = decoder.decode(&pending)?;
+        self.buffer = Zeroizing::new(decoded.bytes);
+        self.offset = 0;
+        self.vision = Some(decoder);
+        Ok(())
+    }
+
+    async fn read_direct(&mut self, output: &mut [u8]) -> Result<usize> {
+        if self.mask.is_none() {
+            return Ok(self.socket.read(output).await?);
+        }
+        let mut written = 0;
+        while written < output.len() {
+            if self.direct_header_len == 0 && self.direct_body_remaining == 0 {
+                let n = self.socket.read(&mut self.direct_header[..1]).await?;
+                if n == 0 {
+                    return Ok(written);
+                }
+                self.direct_header_len = n;
+                self.socket
+                    .read_exact(&mut self.direct_header[self.direct_header_len..])
+                    .await?;
+                self.direct_header_len = 5;
+                self.direct_body_remaining = direct_record_length(&self.direct_header)?;
+                mask_header(&mut self.mask, &mut self.direct_header);
+            }
+            if self.direct_header_offset < self.direct_header_len {
+                let n = (output.len() - written)
+                    .min(self.direct_header_len - self.direct_header_offset);
+                output[written..written + n].copy_from_slice(
+                    &self.direct_header[self.direct_header_offset..self.direct_header_offset + n],
+                );
+                self.direct_header_offset += n;
+                written += n;
+                if self.direct_header_offset == 5 {
+                    self.direct_header_len = 0;
+                    self.direct_header_offset = 0;
+                }
+                continue;
+            }
+            if self.direct_body_remaining > 0 {
+                let available = (output.len() - written).min(self.direct_body_remaining);
+                let n = self
+                    .socket
+                    .read(&mut output[written..written + available])
+                    .await?;
+                if n == 0 {
+                    return Ok(written);
+                }
+                self.direct_body_remaining -= n;
+                written += n;
+            }
+        }
+        Ok(written)
     }
 
     pub async fn read_some(&mut self, output: &mut [u8]) -> Result<usize> {
         if output.is_empty() {
             return Ok(0);
         }
-        if self.offset == self.buffer.len() {
+        loop {
+            if self.offset < self.buffer.len() {
+                let count = output.len().min(self.buffer.len() - self.offset);
+                output[..count].copy_from_slice(&self.buffer[self.offset..self.offset + count]);
+                self.offset += count;
+                return Ok(count);
+            }
+            if self.vision.as_ref().is_some_and(VisionDecoder::is_direct) {
+                return self.read_direct(output).await;
+            }
             let mut header = [0; 5];
             let n = self.socket.read(&mut header[..1]).await?;
             if n == 0 {
@@ -69,11 +162,17 @@ impl Reader {
                 self.cipher = cipher;
             }
             self.offset = 0;
+            if let Some(vision) = self.vision.as_mut() {
+                let decoded = vision.decode(&self.buffer)?;
+                self.buffer = Zeroizing::new(decoded.bytes);
+            }
+            if self.buffer.is_empty() {
+                if self.vision.as_ref().is_some_and(VisionDecoder::is_direct) {
+                    return self.read_direct(output).await;
+                }
+                continue;
+            }
         }
-        let count = output.len().min(self.buffer.len() - self.offset);
-        output[..count].copy_from_slice(&self.buffer[self.offset..self.offset + count]);
-        self.offset += count;
-        Ok(count)
     }
 
     pub async fn read_exact(&mut self, mut output: &mut [u8]) -> Result<()> {
@@ -103,6 +202,10 @@ pub struct Writer {
     mask: Option<HeaderMask>,
     secret: Secret,
     buffer: Zeroizing<Vec<u8>>,
+    vision: Option<VisionEncoder>,
+    direct_header: [u8; 5],
+    direct_header_len: usize,
+    direct_body_remaining: usize,
 }
 
 impl Writer {
@@ -118,10 +221,71 @@ impl Writer {
             mask,
             secret,
             buffer: Zeroizing::new(Vec::with_capacity(5 + RECORD_PAYLOAD + 16)),
+            vision: None,
+            direct_header: [0; 5],
+            direct_header_len: 0,
+            direct_body_remaining: 0,
         }
     }
 
+    pub fn enable_vision(&mut self, uuid: [u8; 16], state: SharedState) -> Result<()> {
+        ensure!(self.vision.is_none(), "Vision already enabled");
+        self.vision = Some(VisionEncoder::new(uuid, state, false));
+        Ok(())
+    }
+
+    pub async fn write_response_header(&mut self) -> Result<()> {
+        self.write_encrypted(&[0, 0]).await
+    }
+
+    async fn write_direct(&mut self, payload: &[u8]) -> Result<()> {
+        if self.mask.is_none() {
+            self.socket.write_all(payload).await?;
+            return Ok(());
+        }
+        let mut output = Zeroizing::new(Vec::with_capacity(payload.len() + 5));
+        let mut position = 0;
+        while position < payload.len() {
+            if self.direct_body_remaining > 0 {
+                let n = (payload.len() - position).min(self.direct_body_remaining);
+                output.extend_from_slice(&payload[position..position + n]);
+                self.direct_body_remaining -= n;
+                position += n;
+                continue;
+            }
+            let take = (5 - self.direct_header_len).min(payload.len() - position);
+            self.direct_header[self.direct_header_len..self.direct_header_len + take]
+                .copy_from_slice(&payload[position..position + take]);
+            self.direct_header_len += take;
+            position += take;
+            if self.direct_header_len < 5 {
+                break;
+            }
+            self.direct_body_remaining = direct_record_length(&self.direct_header)?;
+            mask_header(&mut self.mask, &mut self.direct_header);
+            output.extend_from_slice(&self.direct_header);
+            self.direct_header_len = 0;
+        }
+        if !output.is_empty() {
+            self.socket.write_all(&output).await?;
+        }
+        Ok(())
+    }
+
     pub async fn write_all(&mut self, payload: &[u8]) -> Result<()> {
+        if let Some(vision) = self.vision.as_mut() {
+            if vision.is_direct() {
+                self.write_direct(payload).await?;
+                return Ok(());
+            }
+            let encoded = vision.encode(payload)?;
+            self.write_encrypted(&encoded.bytes).await?;
+            return Ok(());
+        }
+        self.write_encrypted(payload).await
+    }
+
+    async fn write_encrypted(&mut self, payload: &[u8]) -> Result<()> {
         for batch in payload.chunks(4 * RECORD_PAYLOAD) {
             self.buffer.clear();
             for chunk in batch.chunks(RECORD_PAYLOAD) {
@@ -280,12 +444,15 @@ mod tests {
             let mut upload = Vec::new();
             socket.read_to_end(&mut upload).await.unwrap();
             assert_eq!(&upload, b"upload");
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            socket.write_all(b"delayed response").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(650)).await;
+            socket.write_all(b"delayed ").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(650)).await;
+            socket.write_all(b"response").await.unwrap();
             socket.shutdown().await.unwrap();
         };
         let limits = Limits {
             allow_private_destinations: true,
+            half_close_timeout_secs: 1,
             ..Limits::default()
         };
         let forwarding = forward::tcp(

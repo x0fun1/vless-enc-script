@@ -24,11 +24,17 @@ def convert(value, listen=None):
     settings = inbound["settings"]
     if set(settings) - {"clients", "users", "decryption", "flow"}:
         raise ValueError("Unsupported VLESS settings")
+    default_flow = settings.get("flow", "") or ""
+    if default_flow not in ("", "xtls-rprx-vision"):
+        raise ValueError("Unsupported VLESS flow")
     users = settings.get("clients", settings.get("users", []))
-    if settings.get("flow") or any(u.get("flow") for u in users):
-        raise ValueError("Vision is not supported; migrate a plain node without flow")
     if not users or any(set(u) - {"id", "flow", "email", "level"} or u.get("level", 0) != 0 for u in users):
         raise ValueError("Unsupported user settings")
+    flows = [u.get("flow", default_flow) or "" for u in users]
+    if any(flow not in ("", "xtls-rprx-vision") for flow in flows):
+        raise ValueError("Unsupported VLESS user flow")
+    if len(set(flows)) != 1:
+        raise ValueError("Mixed per-user flows cannot be represented by this Rust node")
     outbounds = value.get("outbounds", [])
     if len(outbounds) != 1 or outbounds[0].get("protocol") != "freedom":
         raise ValueError("Exactly one direct freedom outbound is required")
@@ -39,7 +45,7 @@ def convert(value, listen=None):
         raise ValueError("Custom outbound socket settings require manual migration")
     host = inbound.get("listen", "::")
     address = f"[{host}]:{inbound['port']}" if ":" in host else f"{host}:{inbound['port']}"
-    return {"listen": listen or address, "users": [u["id"] for u in users], "decryption": settings["decryption"]}
+    return {"listen": listen or address, "users": [u["id"] for u in users], "decryption": settings["decryption"], "vision": flows[0] == "xtls-rprx-vision"}
 
 def main():
     p = argparse.ArgumentParser()

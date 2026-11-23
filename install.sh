@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="v26.11.23-rust"
-CORE_VERSION="0.2.0"
+SCRIPT_VERSION="v26.11.24-rust"
+CORE_VERSION="0.3.0"
 CORE_REFERENCE="Xray-core v26.11.9"
 BUILD_ROOT=/usr/local/lib/vless-rust-build
 WORK_DIR=''
@@ -21,8 +21,7 @@ Usage: sudo bash install.sh [options]
 
 Installs the independent Rust core, then opens the venc multi-node menu.
 No node or client link is created until you choose Create node.
-Supports VLESS Encryption and experimental REALITY over TLS 1.3.
-Vision and live-target handshake camouflage are not supported.
+Supports VLESS Encryption and experimental REALITY + XTLS Vision over direct TCP, with optional ML-DSA-65 certificate proof. The menu offers X25519- and ML-KEM-768-authenticated REALITY + Vision nodes. Target-derived TLS shaping is limited and does not provide full fingerprint parity.
 EOF
 }
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }

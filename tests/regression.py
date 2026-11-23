@@ -68,18 +68,20 @@ elif kind == "systemctl":
 elif kind == "core":
     command = args[0]
     if command == "capabilities":
-        print("vless-encryption" if os.environ.get("FAKE_NO_REALITY") else "vless-encryption reality-experimental")
+        print("vless-encryption xtls-vision" + ("" if os.environ.get("FAKE_NO_REALITY") else " reality-experimental reality-mldsa65"))
         sys.exit(0)
-    options = {args[i]: args[i+1] for i in range(1, len(args)-1) if args[i].startswith("--") and args[i] != "--reality"}
+    options = {args[i]: args[i+1] for i in range(1, len(args)-1) if args[i].startswith("--") and args[i] not in ("--reality", "--vision", "--mldsa65")}
     path = pathlib.Path(options["--config"])
     if command == "init":
         if path.exists(): sys.exit(2)
-        config = {"listen": "[::]:" + options["--port"], "users": [str(uuid.uuid4())], "decryption": str(uuid.uuid4()), "reality": "--reality" in args}
+        config = {"listen": "[::]:" + options["--port"], "users": [str(uuid.uuid4())], "decryption": str(uuid.uuid4()), "reality": "--reality" in args, "vision": "--vision" in args, "auth": options.get("--auth", "x25519"), "server_name": options.get("--server-name", "www.nvidia.com"), "target": options.get("--target", "www.nvidia.com:443")}
+        if "--mldsa65" in args: config["reality_mldsa65_seed"] = "seed"
         path.write_text(json.dumps(config))
     else: config = json.loads(path.read_text())
     if command in ("init", "link"):
-        security = "reality&sni=example.com&pbk=key&sid=abcd" if config["reality"] else "none"
-        print(f"vless://{config['users'][0]}@{options['--host']}:{config['listen'].rsplit(':', 1)[1]}?encryption=key&security={security}&type=tcp")
+        security = f"reality&sni={config.get('server_name', 'www.nvidia.com')}&pbk=key&sid=abcd&spx=%2Frandom" + ("&pqv=verify-key" if config.get("reality_mldsa65_seed") else "") if config["reality"] else "none"
+        flow = "&flow=xtls-rprx-vision" if config.get("vision") else ""
+        print(f"vless://{config['users'][0]}@{options['--host']}:{config['listen'].rsplit(':', 1)[1]}?encryption=key&security={security}&type=tcp{flow}")
     elif command == "check": print("configuration valid")
     else: raise AssertionError("must not reconfigure existing nodes")
 else: raise AssertionError(kind)
@@ -93,7 +95,7 @@ class DeploymentInstallerTests(unittest.TestCase):
     def test_help_describes_menu_first_and_reality_limits(self):
         result = self.run_installer("--help")
         self.assertEqual(result.returncode, 0, result.stderr)
-        for text in ("VLESS Encryption Rust installer", "--no-menu", "No node or client link is created", "experimental REALITY", "Vision and live-target"):
+        for text in ("VLESS Encryption Rust installer", "--no-menu", "No node or client link is created", "experimental REALITY + XTLS Vision", "Target-derived TLS shaping is limited", "ML-KEM-768-authenticated"):
             self.assertIn(text, result.stdout)
 
     def test_invalid_arguments_fail_before_host_checks(self):
@@ -107,9 +109,9 @@ class DeploymentInstallerTests(unittest.TestCase):
         cargo = (ROOT / "rust-core/Cargo.toml").read_text(encoding="utf-8")
         install = (ROOT / "rust-core/install.sh").read_text(encoding="utf-8")
         source = INSTALLER.read_text(encoding="utf-8")
-        self.assertRegex(cargo, r'(?m)^version = "0\.2\.0"$')
-        self.assertIn("vless-rust 0.2.0 reference Xray-core v26.11.9", install)
-        self.assertIn('CORE_VERSION="0.2.0"', source)
+        self.assertRegex(cargo, r'(?m)^version = "0\.3\.0"$')
+        self.assertIn("vless-rust 0.3.0 reference Xray-core v26.11.9", install)
+        self.assertIn('CORE_VERSION="0.3.0"', source)
         self.assertIn('releases/download/vless-rust-v${CORE_VERSION}', source)
         self.assertIn('vless-rust-deploy.tar.gz', source)
         self.assertIn('"$release_url/$asset.sha256"', source)
@@ -169,16 +171,18 @@ class ManagerTests(unittest.TestCase):
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def test_opening_menu_does_not_create_node(self):
-        result = self.run_menu("0\n")
+        result = self.run_menu("1\n0\n0\n")
         self.assertIn("1. 创建节点", result.stdout)
         self.assertIn("10. 更新脚本并迁移旧版节点", result.stdout)
+        self.assertIn("Reality + XTLS Vision（实验性，X25519）", result.stdout)
+        self.assertIn("Reality + XTLS Vision（实验性，ML-KEM-768）", result.stdout)
         self.assertEqual(self.configs(), {})
         self.assertFalse(self.calls())
 
     def test_multiple_nodes_survive_create_show_and_delete(self):
         self.run_menu("1\n1\n18443\n0\n")
         original = self.configs()
-        self.run_menu("1\n2\n18444\nexample.com\n0\n")
+        self.run_menu("1\n2\n18444\nexample.com\nexample.com:443\n\n0\n")
         combined = self.configs()
         self.assertEqual(len(combined), 2)
         for node, content in original.items(): self.assertEqual(combined[node], content)
@@ -193,6 +197,30 @@ class ManagerTests(unittest.TestCase):
         for call in self.calls():
             if call[0] in ("enable", "disable"):
                 self.assertRegex(call[-1], r"^vless-rust@node-[0-9a-f]{32}$")
+
+    def test_mldsa65_remains_an_explicit_opt_in_for_reality_vision_nodes(self):
+        result = self.run_menu("1\n3\n18445\nexample.com\norigin.example.net:443\ny\n0\n")
+        configs = [json.loads(content) for content in self.configs().values()]
+        self.assertEqual(len(configs), 1)
+        self.assertTrue(configs[0]["reality"])
+        self.assertTrue(configs[0]["vision"])
+        self.assertEqual(configs[0]["auth"], "mlkem768")
+        self.assertEqual(configs[0]["server_name"], "example.com")
+        self.assertEqual(configs[0]["target"], "origin.example.net:443")
+        self.assertEqual(configs[0]["reality_mldsa65_seed"], "seed")
+        self.assertIn("flow=xtls-rprx-vision", result.stdout)
+        self.assertIn("pqv=verify-key", result.stdout)
+
+    def test_reality_vision_x25519_defaults_and_mldsa_disabled(self):
+        self.run_menu("1\n2\n18446\n\n\n\n0\n")
+        configs = [json.loads(content) for content in self.configs().values()]
+        self.assertEqual(len(configs), 1)
+        self.assertTrue(configs[0]["reality"])
+        self.assertTrue(configs[0]["vision"])
+        self.assertEqual(configs[0]["auth"], "x25519")
+        self.assertEqual(configs[0]["server_name"], "www.nvidia.com")
+        self.assertEqual(configs[0]["target"], "www.nvidia.com:443")
+        self.assertNotIn("reality_mldsa65_seed", configs[0])
 
     def test_random_port_uuid_keys_and_blank_type(self):
         self.run_menu("1\n\n\n1\n\n\n0\n")

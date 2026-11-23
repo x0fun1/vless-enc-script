@@ -14,6 +14,7 @@ use ml_kem::{
 use rand::{RngCore, rngs::OsRng};
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -23,6 +24,28 @@ use zeroize::Zeroizing;
 
 type KemSecret = ml_kem::DecapsulationKey<MlKem768>;
 type KemPublic = ml_kem::EncapsulationKey<MlKem768>;
+
+#[derive(Debug)]
+pub struct RetryRequired;
+impl fmt::Display for RetryRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("client must retry without the cached 0-RTT session")
+    }
+}
+impl std::error::Error for RetryRequired {}
+
+pub fn is_retry_required(error: &anyhow::Error) -> bool {
+    error.is::<RetryRequired>()
+}
+
+fn resume_requires_new_handshake(error: &anyhow::Error) -> bool {
+    matches!(
+        error.to_string().as_str(),
+        "expired or unknown session ticket"
+            | "expired session ticket"
+            | "session replay cache limit reached; renegotiation needed"
+    )
+}
 
 enum AuthSecret {
     X25519(StaticSecret),
@@ -207,6 +230,9 @@ impl Server {
                     // A deliberately invalid record header causes official clients
                     // to invalidate their cached ticket and perform a fresh handshake.
                     socket.write_all(&[0; 32]).await?;
+                    if resume_requires_new_handshake(&e) {
+                        return Err(e.context(RetryRequired));
+                    }
                     return Err(e);
                 }
             };
@@ -321,6 +347,31 @@ mod tests {
         assert!(server.resume(ticket, &[43; 32]).is_err());
         assert!(server.resume(ticket, &[44; 32]).is_ok());
     }
+    #[test]
+    fn retry_marker_survives_handshake_contexts() {
+        let marked = anyhow::anyhow!("unknown ticket")
+            .context(RetryRequired)
+            .context("encryption handshake")
+            .context("handshake timeout");
+        assert!(is_retry_required(&marked));
+        assert!(!is_retry_required(&anyhow::anyhow!("ordinary error")));
+    }
+    #[test]
+    fn only_expected_session_expiry_requests_a_clean_retry() {
+        assert!(resume_requires_new_handshake(&anyhow::anyhow!(
+            "expired or unknown session ticket"
+        )));
+        assert!(resume_requires_new_handshake(&anyhow::anyhow!(
+            "expired session ticket"
+        )));
+        assert!(resume_requires_new_handshake(&anyhow::anyhow!(
+            "session replay cache limit reached; renegotiation needed"
+        )));
+        assert!(!resume_requires_new_handshake(&anyhow::anyhow!(
+            "session replay detected"
+        )));
+    }
+
     #[test]
     fn full_cache_preserves_live_sessions_and_advertises_one_rtt() {
         let server = instance(1);
