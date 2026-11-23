@@ -1,183 +1,406 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
-CORE=/usr/local/bin/vless-rust
-CONFIG=/usr/local/etc/vless-rust/config.json
-CONFIG_DIR=/usr/local/etc/vless-rust
-LINK=/root/vless-rust_link.txt
-HOST_FILE=/usr/local/etc/vless-rust/public-host
-UNIT=/etc/systemd/system/vless-rust.service
+# VENC_ROOT is useful for isolated regression tests; production defaults to /.
+PREFIX=${VENC_ROOT:-}
+CORE=$PREFIX/usr/local/bin/vless-rust
+CONFIG_DIR=$PREFIX/usr/local/etc/vless-rust
+NODES_DIR=$CONFIG_DIR/nodes
+CONFIG=$CONFIG_DIR/config.json
+HOST_FILE=$CONFIG_DIR/public-host
+LINK=$PREFIX/root/vless-rust_link.txt
+UNIT=$PREFIX/etc/systemd/system/vless-rust.service
+TEMPLATE=$PREFIX/etc/systemd/system/vless-rust@.service
+NODE_IDS=()
+SELECTED=''
 
-fail() { printf 'Error: %s\n' "$*" >&2; }
-require_root() {
-    [[ "$(id -u)" == 0 ]] || { fail 'Run venc with sudo or as root.'; return 1; }
-}
-
-random_port() {
-    local candidate listeners attempt
-    for attempt in {1..100}; do
-        candidate=$(shuf -i 10000-60000 -n 1)
-        listeners=$(ss -H -ltn "sport = :$candidate") || return 1
-        if [[ -z "$listeners" ]]; then printf '%s\n' "$candidate"; return 0; fi
+fail() { printf '错误: %s\n' "$*" >&2; }
+require_root() { [[ "$(id -u)" == 0 ]] || { fail '请使用 sudo venc 或 root 运行。'; return 1; }; }
+node_dir() { if [[ "$1" == legacy ]]; then printf '%s\n' "$CONFIG_DIR"; else printf '%s/%s\n' "$NODES_DIR" "$1"; fi; }
+node_service() { if [[ "$1" == legacy ]]; then printf 'vless-rust\n'; else printf 'vless-rust@%s\n' "$1"; fi; }
+load_nodes() {
+    local directory id
+    NODE_IDS=()
+    [[ ! -f "$CONFIG" ]] || NODE_IDS+=(legacy)
+    for directory in "$NODES_DIR"/node-*; do
+        [[ -d "$directory" && ! -L "$directory" && -f "$directory/config.json" ]] || continue
+        id=${directory##*/}
+        [[ "$id" =~ ^node-[0-9a-f]{32}$ ]] || continue
+        NODE_IDS+=("$id")
     done
-    return 1
 }
-
+node_link() {
+    local directory host
+    directory=$(node_dir "$1") || return 1
+    host=$(<"$directory/public-host") || { fail "节点 $1 缺少公网地址。"; return 1; }
+    "$CORE" link --config "$directory/config.json" --host "$host"
+}
+node_port() {
+    local directory link
+    directory=$(node_dir "$1") || return 1
+    # Port reservation must not depend on a saved public host. Legacy nodes
+    # without public-host still occupy their configured listener port.
+    link=$("$CORE" link --config "$directory/config.json" --host 127.0.0.1) || return 1
+    link_port "$link"
+}
+link_port() { local endpoint=${1#*@}; endpoint=${endpoint%%\?*}; printf '%s\n' "${endpoint##*:}"; }
+list_nodes() {
+    local id link port type state i=0
+    load_nodes
+    ((${#NODE_IDS[@]})) || { printf '当前没有节点，请选择 1 创建。\n'; return 0; }
+    for id in "${NODE_IDS[@]}"; do
+        i=$((i + 1)); port='?'; type='未知'
+        if link=$(node_link "$id" 2>/dev/null); then
+            port=$(link_port "$link"); type='VLESS+ENC'
+            [[ "$link" != *'security=reality&'* ]] || type='VLESS+ENC+Reality'
+        fi
+        state=$(systemctl is-active "$(node_service "$id")" 2>/dev/null || true)
+        printf '%s. %s | %s/TCP | %s | %s\n' "$i" "$id" "$port" "$type" "${state:-inactive}"
+    done
+}
+select_node() {
+    local input
+    SELECTED=''
+    list_nodes
+    ((${#NODE_IDS[@]})) || return 1
+    read -r -p '请选择节点编号 [0 返回]: ' input || return 1
+    [[ "$input" != 0 ]] || return 1
+    [[ "$input" =~ ^[0-9]{1,5}$ ]] && ((10#$input >= 1 && 10#$input <= ${#NODE_IDS[@]})) || { fail '无效的节点编号。'; return 1; }
+    SELECTED=${NODE_IDS[10#$input - 1]}
+}
+port_available() {
+    local port=$1 listeners id assigned
+    listeners=$(ss -H -ltn "sport = :$port") || { fail '无法检查监听端口。'; return 1; }
+    [[ -z "$listeners" ]] || return 1
+    # A stopped node still reserves its configured port.
+    load_nodes
+    for id in "${NODE_IDS[@]}"; do
+        assigned=$(node_port "$id") || { fail "无法读取节点 $id 的监听端口，不能安全地分配新端口。"; return 1; }
+        [[ "$assigned" != "$port" ]] || return 1
+    done
+}
+random_port() {
+    local candidate attempt
+    for attempt in {1..100}; do
+        candidate=$(shuf -i 10000-60000 -n 1) || return 1
+        if port_available "$candidate"; then printf '%s\n' "$candidate"; return 0; fi
+    done
+    fail '未能找到未占用且未分配的随机端口。'; return 1
+}
 public_host() {
     local host
-    host=$(curl --proto '=https' --tlsv1.2 -4fsS --max-time 8 https://api.ipify.org || true)
-    if [[ ! "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        host=$(curl --proto '=https' --tlsv1.2 -6fsS --max-time 8 https://api64.ipify.org || true)
+    host=${VENC_DEFAULT_HOST:-}
+    if [[ -z "$host" && -f "$HOST_FILE" ]]; then host=$(<"$HOST_FILE"); fi
+    if [[ -z "$host" ]]; then
+        host=$(curl --proto '=https' --tlsv1.2 -4fsS --max-time 8 https://api.ipify.org || true)
+        if [[ ! "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            host=$(curl --proto '=https' --tlsv1.2 -6fsS --max-time 8 https://api64.ipify.org || true)
+        fi
     fi
-    [[ -n "$host" ]] || return 1
+    [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || return 1
     printf '%s\n' "$host"
 }
-
-rollback_configuration() {
-    local backup=$1 was_active=$2
-    if [[ -n "$backup" ]]; then
-        mv -f "$backup" "$CONFIG" || return 1
-        [[ "$was_active" != true ]] || systemctl restart vless-rust || true
-    else
-        rm -f "$CONFIG"
-        systemctl disable --now vless-rust >/dev/null 2>&1 || true
-    fi
-}
-
 save_private_file() {
     local path=$1 value=$2 temporary
     temporary=$(mktemp "${path}.tmp.XXXXXX") || return 1
     if ! printf '%s\n' "$value" > "$temporary" || ! chmod 0600 "$temporary" || ! mv -Tf "$temporary" "$path"; then
-        rm -f "$temporary"
-        return 1
+        rm -f "$temporary"; return 1
     fi
 }
-
+show_node_info() {
+    local id=$1 link port uuid host directory
+    directory=$(node_dir "$id") || return 1
+    link=$(node_link "$id") || return 1
+    port=$(link_port "$link"); uuid=${link#vless://}; uuid=${uuid%%@*}
+    host=$(<"$directory/public-host") || return 1
+    printf '\n节点: %s\n地址: %s\n端口: %s/TCP\nUUID: %s\n服务: %s\n' "$id" "$host" "$port" "$uuid" "$(node_service "$id")"
+    printf '客户端链接:\n%s\n' "$link"
+}
 show_node() {
-    local host link uuid endpoint port
-    [[ -x "$CORE" && -f "$CONFIG" ]] || { fail 'No configured node was found.'; return 1; }
-    host=$(<"$HOST_FILE") || return 1
-    [[ -n "$host" ]] || { fail 'Public host is missing; create the node again.'; return 1; }
-    link=$("$CORE" link --config "$CONFIG" --host "$host") || return 1
-    uuid=${link#vless://}; uuid=${uuid%%@*}
-    endpoint=${link#*@}; endpoint=${endpoint%%\?*}
-    port=${endpoint##*:}
-    printf '\nVLESS+ENC 节点信息\n'
-    printf '地址: %s\n端口: %s/TCP\nUUID: %s\n' "$host" "$port" "$uuid"
-    printf '客户端配置:\n%s\n\n' "$link"
+    local input id
+    list_nodes
+    ((${#NODE_IDS[@]})) || return 0
+    read -r -p '节点编号 [回车显示全部，0 返回]: ' input || return 1
+    [[ "$input" != 0 ]] || return 0
+    if [[ -z "$input" ]]; then
+        for id in "${NODE_IDS[@]}"; do show_node_info "$id" || return 1; done
+    elif [[ "$input" =~ ^[0-9]{1,5}$ ]] && ((10#$input >= 1 && 10#$input <= ${#NODE_IDS[@]})); then
+        show_node_info "${NODE_IDS[10#$input - 1]}"
+    else fail '无效的节点编号。'; return 1; fi
 }
-
+verify_service() {
+    local service=$1 pid
+    pid=$(systemctl show --property=MainPID --value "$service") || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    sleep "${VENC_VERIFY_DELAY:-3}"
+    systemctl is-active --quiet "$service" && [[ "$pid" == "$(systemctl show --property=MainPID --value "$service")" ]]
+}
 create_node() {
-    local host port auth mode uuid input link backup='' was_active=false pid
-    [[ -x "$CORE" ]] || { fail 'vless-rust core is not installed.'; return 1; }
-    host=$(<"$HOST_FILE" 2>/dev/null || true)
-    if [[ -z "$host" ]]; then host=$(public_host) || { fail 'Could not detect the VPS public IP.'; return 1; }; fi
-    read -r -p "VPS 公网 IP/域名 [$host]: " input || return 1
-    host=${input:-$host}
-    [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || { fail 'Invalid public IP/host.'; return 1; }
-
-    port=$(random_port) || { fail 'Could not find a free port from 10000 to 60000.'; return 1; }
-    read -r -p "TCP 端口 [$port]: " input || return 1
-    port=${input:-$port}
-    [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || { fail 'Invalid port.'; return 1; }
-    [[ -z "$(ss -H -ltn "sport = :$port")" ]] || { fail "TCP port $port is already in use."; return 1; }
-
-    read -r -p '认证方式 (x25519/mlkem768) [x25519]: ' auth || return 1
-    auth=${auth:-x25519}
-    [[ "$auth" == x25519 || "$auth" == mlkem768 ]] || { fail 'Invalid auth mode.'; return 1; }
-    read -r -p '流量外观 (native/xorpub/random) [native]: ' mode || return 1
-    mode=${mode:-native}
-    [[ "$mode" == native || "$mode" == xorpub || "$mode" == random ]] || { fail 'Invalid traffic appearance.'; return 1; }
-    uuid=$(< /proc/sys/kernel/random/uuid)
-
-    systemctl is-active --quiet vless-rust && was_active=true || true
-    if [[ -f "$CONFIG" ]]; then
-        backup=$(mktemp "${CONFIG}.backup.XXXXXX") || return 1
-        cp -p "$CONFIG" "$backup" || { rm -f "$backup"; return 1; }
-        link=$("$CORE" configure --config "$CONFIG" --host "$host" --port "$port" --uuid "$uuid" --auth "$auth" --mode "$mode" --rekey) || {
-            rollback_configuration "$backup" "$was_active" || true
-            return 1
-        }
-    else
-        link=$("$CORE" init --config "$CONFIG" --host "$host" --port "$port" --uuid "$uuid" --auth "$auth" --mode "$mode") || {
-            rm -f "$CONFIG"; return 1;
-        }
+    local type input port host name target id directory staged link service
+    local auth=${VENC_DEFAULT_AUTH:-x25519} mode=${VENC_DEFAULT_MODE:-native}
+    local -a options=()
+    [[ -x "$CORE" && -f "$TEMPLATE" ]] || { fail '请先运行安装脚本安装核心及多节点服务模板。'; return 1; }
+    printf '\n1. VLESS + Encryption（无 Reality）\n2. VLESS + Encryption + Reality（实验性）\n0. 返回\n'
+    read -r -p '请选择节点类型 [1]: ' type || return 1
+    type=${type:-1}
+    case "$type" in
+        0) return 0 ;;
+        1) ;;
+        2)
+            [[ "$("$CORE" capabilities)" == *reality-experimental* ]] || { fail '当前核心不支持 Reality，请先更新核心。'; return 1; }
+            printf 'Reality 初版使用 TLS 1.3，不支持 Vision、ML-DSA-65 或目标站握手指纹复刻。\n'
+            ;;
+        *) fail '无效的节点类型。'; return 1 ;;
+    esac
+    read -r -p "TCP 端口 [${VENC_DEFAULT_PORT:-回车随机 10000-60000}]: " input || return 1
+    port=${input:-${VENC_DEFAULT_PORT:-}}
+    if [[ -z "$port" ]]; then port=$(random_port) || return 1; fi
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || { fail '端口必须是 1–65535。'; return 1; }
+    port=$((10#$port))
+    port_available "$port" || { fail "端口 $port 已被服务占用或已分配给其他节点（包括已停止节点）。"; return 1; }
+    host=$(public_host) || host=''
+    if [[ -z "$host" ]]; then
+        read -r -p '无法检测公网 IP，请输入公网 IP/域名: ' host || return 1
+        [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || { fail '无效的公网地址。'; return 1; }
     fi
-    if ! chown root:vless-rust "$CONFIG" || ! chmod 0640 "$CONFIG"; then
-        rollback_configuration "$backup" "$was_active" || true
+    if [[ "$type" == 2 ]]; then
+        read -r -p 'Reality SNI/目标域名 [www.microsoft.com]: ' name || return 1
+        name=${name:-www.microsoft.com}
+        target=${VENC_REALITY_TARGET:-$name:443}
+        options+=(--reality --server-name "$name" --target "$target")
+    fi
+    install -d -m 0750 -o root -g vless-rust "$NODES_DIR" || return 1
+    staged=$(mktemp -d "$NODES_DIR/.create.XXXXXX") || return 1
+    # init creates an independent UUID and keys, never edits an existing node.
+    if ! link=$("$CORE" init --config "$staged/config.json" --host "$host" --port "$port" --auth "$auth" --mode "$mode" "${options[@]}") ||
+       ! "$CORE" check --config "$staged/config.json"; then rm -rf -- "$staged"; return 1; fi
+    id=${link#vless://}; id=${id%%@*}; id=node-${id//-/}
+    [[ "$id" =~ ^node-[0-9a-f]{32}$ ]] || { rm -rf -- "$staged"; fail '核心返回了无效节点 UUID。'; return 1; }
+    directory=$NODES_DIR/$id; service=$(node_service "$id")
+    if [[ -e "$directory" ]] ||
+       ! save_private_file "$staged/public-host" "$host" || ! save_private_file "$staged/link.txt" "$link" ||
+       ! chown root:vless-rust "$staged" "$staged/config.json" || ! chmod 0750 "$staged" || ! chmod 0640 "$staged/config.json" ||
+       ! mv -T -- "$staged" "$directory"; then rm -rf -- "$staged"; return 1; fi
+    if ! systemctl enable --now "$service" || ! verify_service "$service"; then
+        fail '新节点启动失败；保留所有旧节点不变，仅撤销本次创建。'
+        if systemctl disable --now "$service"; then
+            rm -rf -- "$directory"
+            systemctl reset-failed "$service" >/dev/null 2>&1 || true
+        else fail "停止失败，保留 $directory 以便恢复。"; fi
         return 1
     fi
-
-    if ! systemctl enable vless-rust >/dev/null ||
-       ! { if [[ "$was_active" == true ]]; then systemctl restart vless-rust; else systemctl start vless-rust; fi; }; then
-        fail 'Service failed to start; restoring the previous configuration.'
-        rollback_configuration "$backup" "$was_active" || true
-        return 1
-    fi
-    pid=$(systemctl show --property=MainPID --value vless-rust)
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || {
-        fail 'Service has no running main process.'
-        rollback_configuration "$backup" "$was_active" || true
-        return 1
-    }
-    sleep 3
-    if ! systemctl is-active --quiet vless-rust || [[ "$pid" != "$(systemctl show --property=MainPID --value vless-rust)" ]]; then
-        fail 'Service did not remain stable; restoring the previous configuration.'
-        rollback_configuration "$backup" "$was_active" || true
-        return 1
-    fi
-    [[ -z "$backup" ]] || rm -f "$backup"
-    save_private_file "$HOST_FILE" "$host" || fail 'Could not save the public host.'
-    save_private_file "$LINK" "$link" || fail 'Could not save the client link.'
-    printf '\nNode configured and service is running.\n'
-    show_node
+    [[ -f "$HOST_FILE" ]] || save_private_file "$HOST_FILE" "$host" || true
+    printf '\n节点已创建，旧节点未修改。请放行 %s/TCP。\n配置: %s/config.json\n链接: %s/link.txt\n' "$port" "$directory" "$directory"
+    show_node_info "$id"
 }
-
-delete_node() {
-    local answer
-    [[ -f "$CONFIG" ]] || { fail 'No configured node was found.'; return 1; }
-    read -r -p 'Delete the node configuration and client link? [y/N] ' answer || return 1
-    [[ "$answer" =~ ^[Yy]$ ]] || return 0
-    systemctl disable --now vless-rust || return 1
-    rm -f "$CONFIG" "$LINK" "$HOST_FILE"
-    printf 'Node deleted. The core remains installed; use option 1 to create a node again.\n'
+rollback_migration() {
+    local service=$1 destination=$2 old_active=$3 old_enabled=$4 failed=false
+    if ! systemctl stop "$service" >/dev/null 2>&1; then
+        fail "无法停止迁移后的节点服务；为安全起见保留配置：$destination"
+        return 1
+    fi
+    systemctl disable "$service" >/dev/null 2>&1 || true
+    systemctl reset-failed "$service" >/dev/null 2>&1 || true
+    rm -rf -- "$destination" || failed=true
+    case "$old_enabled" in
+        enabled) systemctl enable vless-rust >/dev/null || failed=true ;;
+        enabled-runtime) systemctl enable --runtime vless-rust >/dev/null || failed=true ;;
+        disabled) systemctl disable vless-rust >/dev/null 2>&1 || true ;;
+        disabled-runtime) systemctl disable --runtime vless-rust >/dev/null 2>&1 || true ;;
+    esac
+    if [[ "$old_active" == true ]]; then
+        systemctl reset-failed vless-rust >/dev/null 2>&1 || true
+        systemctl start vless-rust || failed=true
+    fi
+    [[ "$failed" == false ]] || fail '迁移回滚未完全成功，请检查两个节点服务和配置目录。'
+    [[ "$failed" == false ]]
 }
-
-uninstall_core() {
-    local answer
-    read -r -p 'Remove the Rust service, core, node configuration, and venc command? [y/N] ' answer || return 1
-    [[ "$answer" =~ ^[Yy]$ ]] || return 0
-    systemctl disable --now vless-rust >/dev/null 2>&1 || true
-    rm -f "$UNIT" "$CORE" /usr/local/bin/venc "$LINK" "$HOST_FILE"
-    rm -rf "$CONFIG_DIR" /etc/systemd/system/vless-rust.service.d
+migrate_legacy_node() {
+    local host link uuid id port existing existing_port state old_enabled old_active=false
+    local service destination staged new_enabled
+    [[ -f "$CONFIG" ]] || { printf '未发现旧版单节点配置，无需迁移。\n'; return 0; }
+    [[ -f "$TEMPLATE" ]] || { fail '缺少多节点 systemd 模板，请先更新脚本。'; return 1; }
+    [[ -f "$CONFIG" && ! -L "$CONFIG" ]] || { fail '旧版配置必须是普通文件，不能是符号链接。'; return 1; }
+    host=''
+    [[ ! -f "$HOST_FILE" ]] || host=$(<"$HOST_FILE")
+    if [[ ! "$host" =~ ^[A-Za-z0-9.:-]+$ ]]; then host=$(public_host) || host=''; fi
+    if [[ -z "$host" ]]; then
+        read -r -p '请输入旧节点的公网 IP/域名以重建分享链接: ' host || return 1
+    fi
+    [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || { fail '无效的公网地址。'; return 1; }
+    "$CORE" check --config "$CONFIG" || return 1
+    link=$("$CORE" link --config "$CONFIG" --host "$host") || return 1
+    uuid=${link#vless://}; uuid=${uuid%%@*}; id=node-${uuid//-/}
+    [[ "$id" =~ ^node-[0-9a-f]{32}$ ]] || { fail '无法从旧节点链接中识别 UUID，未执行迁移。'; return 1; }
+    port=$(link_port "$link")
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || { fail '无法读取旧节点端口，未执行迁移。'; return 1; }
+    destination=$NODES_DIR/$id; service=$(node_service "$id")
+    [[ ! -e "$destination" && ! -L "$destination" ]] || { fail "目标节点目录已存在：$destination；未覆盖任何文件。"; return 1; }
+    load_nodes
+    for existing in "${NODE_IDS[@]}"; do
+        [[ "$existing" == legacy ]] && continue
+        existing_port=$(node_port "$existing") || { fail "无法验证现有节点 $existing 的端口，不能安全迁移。"; return 1; }
+        [[ "$existing_port" != "$port" ]] || { fail "端口 $port 已被节点 $existing 使用，未执行迁移。"; return 1; }
+    done
+    state=$(systemctl show --property=ActiveState --value vless-rust) || { fail '无法读取旧节点服务状态。'; return 1; }
+    case "$state" in
+        active) old_active=true ;;
+        inactive|failed) ;;
+        *) fail "旧节点服务状态为 $state，请稍后重试。"; return 1 ;;
+    esac
+    old_enabled=$(systemctl is-enabled vless-rust 2>/dev/null || true)
+    case "$old_enabled" in
+        enabled|enabled-runtime|disabled|disabled-runtime) ;;
+        *) fail "旧节点服务启用状态无法识别：${old_enabled:-unknown}。"; return 1 ;;
+    esac
+    new_enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
+    case "$new_enabled" in
+        enabled|enabled-runtime|linked|linked-runtime|static|indirect|masked)
+            fail "新服务 $service 已存在或已启用，请先检查 systemd 状态。"; return 1 ;;
+    esac
     systemctl daemon-reload || return 1
+    install -d -m 0750 -o root -g vless-rust "$NODES_DIR" || return 1
+    staged=$(mktemp -d "$NODES_DIR/.migration.XXXXXX") || return 1
+    if ! cp -- "$CONFIG" "$staged/config.json" ||
+       ! save_private_file "$staged/public-host" "$host" ||
+       ! save_private_file "$staged/link.txt" "$link" ||
+       ! chown root:vless-rust "$staged" "$staged/config.json" ||
+       ! chmod 0750 "$staged" || ! chmod 0640 "$staged/config.json" ||
+       ! mv -T -- "$staged" "$destination"; then
+        rm -rf -- "$staged"; return 1
+    fi
+    if [[ "$old_active" == true ]] && ! systemctl stop vless-rust; then
+        rm -rf -- "$destination"
+        fail '无法停止旧节点服务，迁移已取消。'; return 1
+    fi
+    case "$old_enabled" in
+        enabled)
+            if [[ "$old_active" == true ]]; then
+                systemctl enable --now "$service" || { rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true; return 1; }
+            else
+                systemctl enable "$service" || { rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true; return 1; }
+            fi ;;
+        enabled-runtime)
+            if [[ "$old_active" == true ]]; then
+                systemctl enable --runtime --now "$service" || { rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true; return 1; }
+            else
+                systemctl enable --runtime "$service" || { rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true; return 1; }
+            fi ;;
+        disabled|disabled-runtime)
+            if [[ "$old_active" == true ]] && ! systemctl start "$service"; then
+                rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true; return 1
+            fi ;;
+    esac
+    if [[ "$old_active" == true ]] && ! verify_service "$service"; then
+        fail '迁移后的服务未能稳定运行，正在恢复旧节点。'
+        rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true
+        return 1
+    fi
+    case "$old_enabled" in
+        enabled) systemctl disable vless-rust >/dev/null || { rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true; return 1; } ;;
+        enabled-runtime) systemctl disable --runtime vless-rust >/dev/null || { rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true; return 1; } ;;
+    esac
+    if [[ -f "$LINK" ]] && ! save_private_file "$LINK" "$link"; then
+        fail '无法更新旧版分享链接文件，正在回滚迁移。'
+        rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true
+        return 1
+    fi
+    if ! rm -f -- "$CONFIG"; then
+        fail '无法移除旧版配置文件，正在回滚迁移。'
+        rollback_migration "$service" "$destination" "$old_active" "$old_enabled" || true
+        return 1
+    fi
     systemctl reset-failed vless-rust >/dev/null 2>&1 || true
-    printf 'Rust core and venc command removed. The vless-rust system account was left intact.\n'
+    printf '\n旧版节点已迁移至 %s，UUID、端口、Encryption/Reality 凭据均保留。\n' "$destination"
+    printf '新服务：%s；运行状态：%s；端口：%s/TCP。\n' "$service" "$(if [[ "$old_active" == true ]]; then printf 'active'; else printf 'inactive'; fi)" "$port"
+}
+update_and_migrate() {
+    local installer status answer
+    read -r -p '将从 GitHub 下载并运行最新版安装脚本，随后迁移旧版节点。继续？[y/N] ' answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    command -v curl >/dev/null 2>&1 || { fail '缺少 curl，无法在线更新。'; return 1; }
+    installer=$(mktemp) || return 1
+    exec 9>&-
+    if curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+        https://raw.githubusercontent.com/x0fun1/vless-enc-script/main/install.sh -o "$installer" &&
+       bash "$installer" --no-menu; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f -- "$installer"
+    exec 9>"$CONFIG_DIR/.manager.lock"
+    if ! flock -n 9; then
+        fail '更新已结束，但无法重新取得管理锁；请重新运行 sudo venc。'
+        exit 1
+    fi
+    if ((status != 0)); then fail '在线更新失败，旧版脚本仍可继续使用。'; return 1; fi
+    printf '\n脚本和核心已更新。正在检查并迁移旧版单节点……\n'
+    if [[ -f "$CONFIG" ]] && ! migrate_legacy_node; then
+        fail '更新已完成，但旧节点迁移未完成；旧配置仍保留，可稍后重新运行选项 10。'
+    fi
+    exec "$0"
+}
+delete_node() {
+    local answer id directory service
+    select_node || return 0
+    id=$SELECTED; directory=$(node_dir "$id"); service=$(node_service "$id")
+    read -r -p "仅删除节点 $id？[y/N] " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    systemctl disable --now "$service" || return 1
+    if [[ "$id" == legacy ]]; then rm -f "$CONFIG" "$LINK"; else rm -rf -- "$directory"; fi
+    systemctl reset-failed "$service" >/dev/null 2>&1 || true
+    printf '所选节点已删除，其他节点未修改。\n'
+}
+manage_service() {
+    local action=$1
+    select_node || return 0
+    case "$action" in
+        logs) journalctl -u "$(node_service "$SELECTED")" -n 100 --no-pager ;;
+        status) systemctl status "$(node_service "$SELECTED")" --no-pager ;;
+        *) systemctl "$action" "$(node_service "$SELECTED")" ;;
+    esac
+}
+uninstall_core() {
+    local answer id
+    read -r -p '卸载核心、venc 和全部节点？[y/N] ' answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    load_nodes
+    for id in "${NODE_IDS[@]}"; do systemctl disable --now "$(node_service "$id")" || return 1; done
+    rm -f "$UNIT" "$TEMPLATE" "$CORE" "$PREFIX/usr/local/bin/venc" "$LINK"
+    rm -rf -- "$CONFIG_DIR"
+    systemctl daemon-reload || return 1
+    printf '已卸载全部节点和核心；保留 vless-rust 系统账户。\n'
     exit 0
 }
-
 main() {
+    local choice
     require_root || return 1
+    install -d -m 0750 -o root -g vless-rust "$CONFIG_DIR" || return 1
+    # Serialize mutations, including port allocation, across manager sessions.
+    exec 9>"$CONFIG_DIR/.manager.lock"
+    flock -n 9 || { fail '另一个 venc 会话正在运行，请稍后重试。'; return 1; }
+    if [[ ! -t 0 && -t 1 && -r /dev/tty ]]; then exec </dev/tty; fi
     while true; do
-        printf '\nVLESS+ENC 节点管理\n'
-        printf '1. 创建/重配节点\n2. 删除节点配置\n3. 显示节点信息\n'
-        printf '4. 停止服务\n5. 删除核心和 venc 命令\n6. 启动服务\n'
-        printf '7. 重启服务\n8. 查看服务日志\n9. 查看服务状态\n0. 退出\n'
-        read -r -p '请选择 [0-9]: ' choice || return 1
+        printf '\nVLESS+ENC 多节点管理\n'
+        printf '1. 创建节点\n2. 删除指定节点\n3. 显示节点信息\n4. 停止指定节点\n5. 卸载核心和全部节点\n'
+        printf '6. 启动指定节点\n7. 重启指定节点\n8. 查看节点日志\n9. 查看节点状态\n10. 更新脚本并迁移旧版节点\n0. 退出\n'
+        read -r -p '请选择 [0-9]: ' choice || return 0
         case "$choice" in
             1) create_node || true ;;
             2) delete_node || true ;;
             3) show_node || true ;;
-            4) systemctl stop vless-rust || true ;;
+            4) manage_service stop || true ;;
             5) uninstall_core || true ;;
-            6) systemctl start vless-rust || true ;;
-            7) systemctl restart vless-rust || true ;;
-            8) journalctl -u vless-rust -f --no-pager || true ;;
-            9) systemctl status vless-rust --no-pager || true ;;
+            6) manage_service start || true ;;
+            7) manage_service restart || true ;;
+            8) manage_service logs || true ;;
+            9) manage_service status || true ;;
+            10) update_and_migrate || true ;;
             0) return 0 ;;
             *) fail '请输入菜单中的选项。' ;;
         esac
     done
 }
-
 main "$@"

@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CREATE_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -166,6 +167,8 @@ def main():
     parser.add_argument("--reference", type=pathlib.Path, default=ROOT / ".build/reference" / ("xray.exe" if os.name == "nt" else "xray"))
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--relays-only", action="store_true")
+    parser.add_argument("--reality", action="store_true", help="exercise experimental REALITY TLS 1.3 with the official client")
+    parser.add_argument("--fingerprint", default="chrome", choices=("chrome", "firefox", "safari"), help="REALITY client TLS fingerprint")
     args = parser.parse_args()
     version = subprocess.check_output([str(args.reference), "version"], text=True, creationflags=CREATE_FLAGS)
     assert version.startswith("Xray 26.11.9 "), version
@@ -179,7 +182,7 @@ def main():
         if args.relays_only:
             variants = [("relay8", m, c, False) for m in ("native", "xorpub", "random") for c in ("aes", "chacha")]
         for auth, mode, cipher, mux in variants:
-            label = f"{auth}-{mode}-{cipher}-mux{int(mux)}"
+            label = f"{'reality-' + args.fingerprint + '-' if args.reality else ''}{auth}-{mode}-{cipher}-mux{int(mux)}"
             with tempfile.TemporaryDirectory(dir=output) as directory:
                 d = pathlib.Path(directory)
                 if auth == "relay8":
@@ -190,8 +193,15 @@ def main():
                 node, socks = port(), port()
                 uid = str(uuid.uuid4())
                 config = {"listen": f"127.0.0.1:{node}", "users": [uid], "decryption": keys["decryption"], "log_connections": True, "limits": {"allow_private_destinations": True}}
+                reality_link = None
+                if args.reality:
+                    reality_link = subprocess.check_output([str(args.rust), "init", "--config", str(d / "reality.json"), "--host", "127.0.0.1", "--reality", "--server-name", "example.com", "--target", f"127.0.0.1:{target}"], text=True, creationflags=CREATE_FLAGS).strip()
+                    config["reality"] = json.loads((d / "reality.json").read_text())["reality"]
                 (d / "server.json").write_text(json.dumps(config))
                 client = {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": socks, "protocol": "socks", "settings": {"udp": True}}], "outbounds": [{"protocol": "vless", "settings": {"address": "127.0.0.1", "port": node, "id": uid, "encryption": keys["encryption"]}, "streamSettings": {"method": "raw", "security": "none"}, "mux": {"enabled": mux, "concurrency": 8}}]}
+                if reality_link:
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(reality_link).query)
+                    client["outbounds"][0]["streamSettings"].update({"security": "reality", "realitySettings": {"serverName": "example.com", "fingerprint": args.fingerprint, "publicKey": query["pbk"][0], "shortId": query["sid"][0], "spiderX": "/"}})
                 if mux == -1:
                     client["outbounds"][0]["mux"] = {"enabled": False, "concurrency": -1, "xudpConcurrency": -1}
                 (d / "client.json").write_text(json.dumps(client))
@@ -218,13 +228,15 @@ def main():
                             print(client_log.read_text(errors="replace"))
                             raise
                 log = server_log.read_text(errors="replace")
+                if args.reality:
+                    assert "reality_tls_group=" in log, "REALITY TLS handshake was not exercised"
                 expected = "Aes" if cipher == "aes" else "ChaCha"
                 assert f"cipher={expected}" in log, log
                 if mux is False or mux == -1:
                     assert "handshake=0rtt" in log, "0-RTT resumption was not exercised"
                 report.append({"case": label, "result": "passed", "cipher_verified": expected, "resumption_verified": mux is False or mux == -1})
                 print(f"PASS {label}", flush=True)
-    (output / ("relay-results.json" if args.relays_only else "results.json")).write_text(json.dumps(report, indent=2) + "\n")
+    (output / ("reality-" + args.fingerprint + "-results.json" if args.reality else "relay-results.json" if args.relays_only else "results.json")).write_text(json.dumps(report, indent=2) + "\n")
     print(f"{len(report)} official client variants passed")
 
 if __name__ == "__main__":

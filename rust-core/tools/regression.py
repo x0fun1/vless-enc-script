@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 import uuid
+import urllib.parse
 from import_xray import convert
 from interop import ROOT, CREATE_FLAGS, Echo, exact, port, process, service, socks_connect, wait_port
 
@@ -65,6 +66,41 @@ class Regression(unittest.TestCase):
             rebuilt = subprocess.check_output([str(RUST), "link", "--config", str(path), "--host", "example.com"], text=True, creationflags=CREATE_FLAGS).strip()
             self.assertEqual(created, rebuilt)
             self.assertTrue(created.startswith(f"vless://{uid}@"))
+
+    def test_reality_link_roundtrips_and_reconfiguration_preserves_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "config.json"
+            created = subprocess.check_output([str(RUST), "init", "--config", str(path), "--host", "2001:db8::1", "--port", "18443", "--reality", "--server-name", "example.com"], text=True, creationflags=CREATE_FLAGS).strip()
+            config = json.loads(path.read_text())
+            self.assertEqual(config["reality"]["target"], "example.com:443")
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(created).query)
+            self.assertEqual(query["security"], ["reality"])
+            self.assertEqual(query["sni"], ["example.com"])
+            self.assertEqual(query["sid"], [config["reality"]["short_id"]])
+            self.assertIn("encryption", query)
+            self.assertNotIn(config["reality"]["private_key"], created)
+            rebuilt = subprocess.check_output([str(RUST), "link", "--config", str(path), "--host", "2001:db8::1"], text=True, creationflags=CREATE_FLAGS).strip()
+            self.assertEqual(created, rebuilt)
+            subprocess.check_call([str(RUST), "configure", "--config", str(path), "--host", "example.com", "--port", "18444"], stdout=subprocess.DEVNULL, creationflags=CREATE_FLAGS)
+            updated = json.loads(path.read_text())
+            self.assertEqual(updated["reality"], config["reality"])
+            self.assertEqual(updated["decryption"], config["decryption"])
+
+    def test_reality_unauthenticated_bytes_are_relayed_to_target(self):
+        with service(Echo) as target, tempfile.TemporaryDirectory() as directory:
+            d = pathlib.Path(directory)
+            node = port()
+            subprocess.check_call([str(RUST), "init", "--config", str(d / "server.json"), "--host", "127.0.0.1", "--listen-host", "127.0.0.1", "--port", str(node), "--reality", "--server-name", "example.com", "--target", f"127.0.0.1:{target}"], stdout=subprocess.DEVNULL, creationflags=CREATE_FLAGS)
+            with process(RUST, d / "server.json", d / "server.log") as server:
+                wait_port(node, server)
+                for payload in (b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", b"\x16\x03\x03\x00\x05\x01\x00\x00\x01\x00"):
+                    with socket.create_connection(("127.0.0.1", node), timeout=5) as s:
+                        s.settimeout(5)
+                        s.sendall(payload[:3])
+                        s.sendall(payload[3:])
+                        self.assertEqual(exact(s, len(payload)), payload)
+                        s.sendall(b"follow-up")
+                        self.assertEqual(exact(s, 9), b"follow-up")
 
     def test_configure_preserves_keys_until_explicit_rekey(self):
         with tempfile.TemporaryDirectory() as directory:

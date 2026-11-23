@@ -17,10 +17,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -129,7 +126,10 @@ impl Server {
         Ok(united)
     }
 
-    pub async fn handshake(&self, mut socket: TcpStream) -> Result<(Reader, Writer, bool)> {
+    pub async fn handshake<S>(&self, mut socket: S) -> Result<(Reader, Writer, bool)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let mut hello = vec![0; 16 + self.relays_length];
         socket
             .read_exact(&mut hello)
@@ -224,7 +224,7 @@ impl Server {
                 (None, None)
             };
             let united = Arc::new(united);
-            let (read, write) = socket.into_split();
+            let (read, write) = tokio::io::split(socket);
             return Ok((
                 Reader::new(read, up, up_mask, united.clone()),
                 Writer::new(write, down, down_mask, united),
@@ -289,7 +289,7 @@ impl Server {
             (None, None)
         };
         let united = Arc::new(united);
-        let (read, write) = socket.into_split();
+        let (read, write) = tokio::io::split(socket);
         Ok((
             Reader::new(read, up, up_mask, united.clone()),
             Writer::new(write, down, down_mask, united),

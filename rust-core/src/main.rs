@@ -11,6 +11,7 @@ mod destination;
 mod forward;
 mod handshake;
 mod mux;
+mod reality;
 mod record;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -82,8 +83,19 @@ fn subscription(config: &Config, host: &str) -> Result<String> {
         host.to_owned()
     };
     let uuid = config.users.first().context("missing user UUID")?;
+    let security = if let Some(reality) = &config.reality {
+        format!(
+            "reality&sni={}&fp=chrome&pbk={}&sid={}&spx=%2F",
+            reality.server_name,
+            reality.public_key()?,
+            reality.short_id
+        )
+    } else {
+        "none".to_owned()
+    };
     Ok(format!(
-        "vless://{uuid}@{host}:{}?encryption={encryption}&security=none&type=tcp#VLESS-Rust",
+        "vless://{uuid}@{host}:{}?encryption={encryption}&security={security}&type=tcp#VLESS-Rust-{}",
+        config.listen.port(),
         config.listen.port()
     ))
 }
@@ -356,6 +368,7 @@ fn import_xray_config(
         listen: SocketAddr::new(listen_host, port.unwrap_or(original_port as u16)),
         users: migrated_users,
         decryption: original_decryption.to_owned(),
+        reality: None,
         limits: Limits::default(),
         log_connections: false,
     };
@@ -376,6 +389,12 @@ async fn shutdown_signal() -> Result<()> {
 }
 
 async fn serve(config: Config) -> Result<()> {
+    let reality = config
+        .reality
+        .clone()
+        .map(|c| reality::Server::new(c, config.limits.max_sessions))
+        .transpose()?
+        .map(Arc::new);
     let server = Arc::new(handshake::Server::new(
         EncryptionConfig::parse(&config.decryption)?,
         config.limits.clone(),
@@ -426,20 +445,29 @@ async fn serve(config: Config) -> Result<()> {
             result = listener.accept() => {
                 let (socket, peer) = match result { Ok(pair) => pair, Err(e) => { eprintln!("accept error: {e}"); tokio::time::sleep(Duration::from_millis(100)).await; continue; } };
                 let Ok(client_permit) = clients.clone().try_acquire_owned() else { drop(socket); continue; };
-                let server = server.clone(); let config = config.clone(); let handshakes = handshakes.clone(); let outbounds = outbounds.clone();
+                let server = server.clone(); let config = config.clone(); let reality = reality.clone(); let handshakes = handshakes.clone(); let outbounds = outbounds.clone();
                 let errors = errors.clone(); let resumes = resumes.clone();
                 let id = total.fetch_add(1, Ordering::Relaxed) + 1;
                 tasks.spawn(async move {
                     let _client = client_permit;
                     let result: Result<()> = async {
                         forward::configure_tcp(&socket, &config.limits).context("configure inbound TCP")?;
-                        let ((reader, writer, resumed), req) = timeout(Duration::from_secs(config.limits.handshake_timeout_secs), async {
+                        let request = timeout(Duration::from_secs(config.limits.handshake_timeout_secs), async {
                             let permit = handshakes.acquire_owned().await?;
-                            let (mut reader, writer, resumed) = server.handshake(socket).await.context("encryption handshake")?;
+                            let (mut reader, writer, resumed) = if let Some(reality) = reality {
+                                let Some(socket) = reality.accept(socket).await? else { return Ok(None); };
+                                if config.log_connections {
+                                    eprintln!("connection={id} reality_tls_group={:?}", socket.get_ref().1.negotiated_key_exchange_group().map(|g| g.name()));
+                                }
+                                server.handshake(socket).await.context("encryption handshake")?
+                            } else {
+                                server.handshake(socket).await.context("encryption handshake")?
+                            };
                             let req = forward::request(&mut reader, &config).await.context("VLESS request")?;
                             drop(permit);
-                            Ok::<_, anyhow::Error>(((reader, writer, resumed), req))
+                            Ok::<_, anyhow::Error>(Some(((reader, writer, resumed), req)))
                         }).await.context("handshake timeout")??;
+                        let Some(((reader, writer, resumed), req)) = request else { return Ok(()); };
                         if resumed { resumes.fetch_add(1, Ordering::Relaxed); }
                         if config.log_connections { eprintln!("connection={id} peer={peer} handshake={} cipher={:?}", if resumed { "0rtt" } else { "1rtt" }, reader.algorithm()); }
                         let activity = forward::Activity::new();
@@ -476,7 +504,7 @@ fn main() -> Result<()> {
     let command = args.first().map(String::as_str).unwrap_or("help");
     if ["help", "--help", "-h"].contains(&command) {
         println!(
-            "vless-rust {} (reference {REFERENCE})\n\nCommands:\n  init --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  configure --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--rekey] [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  link --config FILE --host HOST\n  keygen [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  check --config FILE\n  run --config FILE\n  version\n\nSupports plain VLESS Encryption, TCP/UDP and XUDP. REALITY and Vision are not supported.\nConfiguration contains private keys: keep it private.",
+            "vless-rust {} (reference {REFERENCE})\n\nCommands:\n  init --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--auth x25519|mlkem768] [--mode native|xorpub|random] [--reality --server-name DOMAIN [--target HOST:PORT]]\n  configure --config FILE --host HOST [--listen-host IP] [--port PORT] [--uuid UUID] [--rekey] [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  link --config FILE --host HOST\n  keygen [--auth x25519|mlkem768] [--mode native|xorpub|random]\n  check --config FILE\n  run --config FILE\n  version\n  capabilities\n\nSupports VLESS Encryption, TCP/UDP and XUDP, and experimental REALITY over TLS 1.3. Vision, ML-DSA-65 and live-target handshake camouflage are not supported.\nConfiguration contains private keys: keep it private.",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -489,6 +517,11 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if command == "capabilities" {
+        ensure!(args.len() == 1, "unexpected capabilities arguments");
+        println!("vless-encryption reality-experimental");
+        return Ok(());
+    }
     let mut path = None;
     let mut input = None;
     let mut host = None;
@@ -498,11 +531,19 @@ fn main() -> Result<()> {
     let mut auth = None;
     let mut mode = None;
     let mut rekey = false;
+    let mut use_reality = false;
+    let mut server_name = None;
+    let mut target = None;
     let mut i = 1;
     while i < args.len() {
         let option = args[i].as_str();
         if command == "configure" && option == "--rekey" {
             rekey = true;
+            i += 1;
+            continue;
+        }
+        if command == "init" && option == "--reality" {
+            use_reality = true;
             i += 1;
             continue;
         }
@@ -535,6 +576,8 @@ fn main() -> Result<()> {
                 )
             }
             ("import-xray", "--port") => port = Some(value.parse::<u16>().context("invalid port")?),
+            ("init", "--server-name") => server_name = Some(value.clone()),
+            ("init", "--target") => target = Some(value.clone()),
             ("keygen" | "init" | "configure", "--auth") => auth = Some(value.as_str()),
             ("keygen" | "init" | "configure", "--mode") => mode = Some(value.as_str()),
             _ => bail!("unknown command or option: {command} {option}"),
@@ -566,6 +609,19 @@ fn main() -> Result<()> {
                 listen: SocketAddr::new(listen_host.unwrap_or("::".parse()?), port.unwrap_or(443)),
                 users: vec![uuid],
                 decryption,
+                reality: if use_reality {
+                    let name = server_name.context("--server-name required with --reality")?;
+                    Some(reality::RealityConfig::generate(
+                        name.clone(),
+                        target.unwrap_or_else(|| format!("{name}:443")),
+                    )?)
+                } else {
+                    ensure!(
+                        server_name.is_none() && target.is_none(),
+                        "--server-name/--target require --reality"
+                    );
+                    None
+                },
                 limits: Limits::default(),
                 log_connections: false,
             };
@@ -629,6 +685,9 @@ fn main() -> Result<()> {
             let path = Path::new(path.context("--config required")?);
             let config = Config::load(path)?;
             if command == "check" {
+                if let Some(reality) = config.reality.clone() {
+                    reality::Server::new(reality, config.limits.max_sessions)?;
+                }
                 handshake::Server::new(
                     EncryptionConfig::parse(&config.decryption)?,
                     config.limits,

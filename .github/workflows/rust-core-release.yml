@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - "rust-core/**"
+      - "tests/**"
+      - "install.sh"
       - ".github/workflows/rust-core-release.yml"
   workflow_dispatch:
 
@@ -27,6 +29,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: 1.100.0
+      - name: Test and lint
+        working-directory: rust-core
+        run: |
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          python3 ../tests/regression.py
       - name: Build release binary
         working-directory: rust-core
         run: cargo build --locked --release
@@ -52,6 +60,8 @@ jobs:
           sparse-checkout: |
             rust-core/Cargo.toml
             rust-core/venc
+            rust-core/install.sh
+            rust-core/systemd/
       - uses: actions/download-artifact@v4
         with:
           pattern: vless-rust-*
@@ -68,6 +78,8 @@ jobs:
         run: |
           install -m 0755 rust-core/venc dist/venc
           sha256sum dist/venc | awk '{print $1}' > dist/venc.sha256
+          tar -czf dist/vless-rust-deploy.tar.gz -C rust-core install.sh venc systemd/vless-rust.service 'systemd/vless-rust@.service'
+          sha256sum dist/vless-rust-deploy.tar.gz | awk '{print $1}' > dist/vless-rust-deploy.tar.gz.sha256
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: vless-rust-v${{ steps.package.outputs.version }}

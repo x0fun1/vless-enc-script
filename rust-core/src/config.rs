@@ -105,6 +105,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub users: Vec<Uuid>,
     pub decryption: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality: Option<crate::reality::RealityConfig>,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
@@ -166,6 +168,9 @@ impl Config {
             "invalid keepalive_retries"
         );
         EncryptionConfig::parse(&self.decryption)?;
+        if let Some(reality) = &self.reality {
+            reality.validate()?;
+        }
         Ok(())
     }
 }

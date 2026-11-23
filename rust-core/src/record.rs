@@ -3,17 +3,14 @@
 use crate::crypto::{Aead, HeaderMask, mask_header};
 use anyhow::{Result, ensure};
 use std::sync::Arc;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
 type Secret = Arc<Zeroizing<Vec<u8>>>;
 pub const RECORD_PAYLOAD: usize = 8192;
 
 pub struct Reader {
-    socket: OwnedReadHalf,
+    socket: Box<dyn AsyncRead + Unpin + Send>,
     cipher: Aead,
     mask: Option<HeaderMask>,
     secret: Secret,
@@ -26,13 +23,13 @@ impl Reader {
         self.cipher.algorithm
     }
     pub fn new(
-        socket: OwnedReadHalf,
+        socket: impl AsyncRead + Unpin + Send + 'static,
         cipher: Aead,
         mask: Option<HeaderMask>,
         secret: Secret,
     ) -> Self {
         Self {
-            socket,
+            socket: Box::new(socket),
             cipher,
             mask,
             secret,
@@ -101,7 +98,7 @@ impl Reader {
 }
 
 pub struct Writer {
-    socket: OwnedWriteHalf,
+    socket: Box<dyn AsyncWrite + Unpin + Send>,
     cipher: Aead,
     mask: Option<HeaderMask>,
     secret: Secret,
@@ -110,13 +107,13 @@ pub struct Writer {
 
 impl Writer {
     pub fn new(
-        socket: OwnedWriteHalf,
+        socket: impl AsyncWrite + Unpin + Send + 'static,
         cipher: Aead,
         mask: Option<HeaderMask>,
         secret: Secret,
     ) -> Self {
         Self {
-            socket,
+            socket: Box::new(socket),
             cipher,
             mask,
             secret,
