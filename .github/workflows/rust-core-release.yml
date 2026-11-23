@@ -36,7 +36,18 @@ jobs:
         working-directory: rust-core
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Deployment/menu regression tests
-        run: python3 tests/regression.py
+        shell: bash
+        run: |
+          if python3 tests/regression.py > regression.log 2>&1; then
+            cat regression.log
+          else
+            status=$?
+            cat regression.log
+            grep -E '^(FAIL|ERROR):|^AssertionError:|^Ran ' regression.log | while IFS= read -r line; do
+              echo "::error title=Deployment regression::$line"
+            done
+            exit "$status"
+          fi
       - name: Build release binary
         working-directory: rust-core
         run: cargo build --locked --release
