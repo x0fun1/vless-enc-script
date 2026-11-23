@@ -2,9 +2,10 @@
 import json
 import os
 import pathlib
-import re
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -139,7 +140,7 @@ class ManagerTests(unittest.TestCase):
         fake.write_text(FAKE, encoding="utf-8")
         def wrapper(path, kind):
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"#!/usr/bin/env bash\nexec python '{fake.as_posix()}' {kind} \"$@\"\n", encoding="utf-8", newline="\n")
+            path.write_text(f"#!/usr/bin/env bash\nexec {shlex.quote(sys.executable.replace(chr(92), '/'))} {shlex.quote(fake.as_posix())} {kind} \"$@\"\n", encoding="utf-8", newline="\n")
             path.chmod(0o755)
         for cmd in ("id", "install", "chown", "flock", "ss", "shuf", "curl", "systemctl"):
             wrapper(self.mock_bin / cmd, cmd)
