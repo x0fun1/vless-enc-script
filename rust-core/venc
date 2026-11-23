@@ -340,7 +340,7 @@ update_and_migrate() {
     if [[ -f "$CONFIG" ]] && ! migrate_legacy_node; then
         fail '更新已完成，但旧节点迁移未完成；旧配置仍保留，可稍后重新运行选项 10。'
     fi
-    exec "$0"
+    exec bash "$0"
 }
 delete_node() {
     local answer id directory service
