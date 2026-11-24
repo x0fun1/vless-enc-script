@@ -76,3 +76,14 @@ REALITY 指纹捕获仍仅涵盖完整 ServerHello 位于单个 TLS record、兼
 本次自动化安全依赖检查：cargo-audit v0.23.0 对应用锁文件（131 个依赖）及 vendored rustls 锁文件（134 个依赖）分别扫描，均无告警 / advisories。RustSec advisory database commit `52384ab5581a4487b62c549eef95cf7ba7e8bad5`（2026-11-23）；扫描未使用 ignore。主构建解析 rustls-webpki 0.103.17；vendor lock 中 rustls-webpki 0.103.17、webpki-roots 1.0.10。RUSTSEC-2024-0437 的 protobuf 不在这两个依赖图中。
 
 开发过程还做了针对 REALITY trust probe / certificate chain / SNI hostname、target DNS self-loop 和 SSRF 边界、ClientHello / TLS length parsing、replay bounds、Vision frame bounds / random header protection、ML-DSA signature key verification 的定向代码审查和负向互通检查；详情仍需由未参与实现的第三方审计方独立复核。
+
+## v0.3.1 发布后的未发布 Vision 补丁（Windows 本地验证）
+
+候选 commit `fc534857ed817982aa5b56db5786e40f1f5e2ecf` 位于本地分支 `security/vision-fragment-eof`，基于已发布 main commit `b466bf7e51fbf9045826ebbad41972e15bffd14d`。它**尚未推送、尚未发布，也没有 Debian/CI 验证**；包版本仍显示 0.3.1，不能将其与 0.3.1 发布二进制混为一谈。
+
+- `Reader::read_direct()` 在已开始的 TLS record body 处遇到 EOF 时，现返回截断错误而非把截断记录视为干净 EOF。
+- Vision ServerHello 检测现在可跨 TLS header / record 的读分片累计最多一个受限 ServerHello record，并累计其 supported_versions 扩展；测试覆盖每个二分边界、逐字节切分及不允许直接切换的 ChaCha TLS suite。
+- 新的 record-layer 双端合成测试经带 header masking 的加密记录进入 Direct，确认 uplink 与 downlink 状态切换、分片 TLS record header 的传输、record 边界上的 clean half-close，以及两方向的 header/body 截断报错。它证明实现路径受测，不代表官方客户端实际产生双向 Direct。
+- Windows 候选验证：34 项 Rust tests、strict Clippy、locked release build、核心 14 项和部署 16 项回归通过；官方 Xray 26.11.9 的 REALITY+Vision 30 变体、plain Vision 30 变体，以及 ML-DSA-65 native/random 子集互通通过。Chrome/Firefox/Safari REALITY quick 用例通过。
+- 官方 Xray 实际系统日志仍只观察到个别连接的 downlink Direct 转换，uplink Direct 计数仍为 0；Mux 示例没有 Direct 转换。合成双向测试不能替代真实双向互通证据，因此仍不宣称 Vision 双向 Direct parity。
+- 此补丁还没有在 Debian 13、Rust 1.89、systemd、发布包安装或 off-host 环境复测；应在发布前补齐。独立审计仍未委托或完成，审计范围草稿见仓库根目录 `SECURITY_AUDIT_BRIEF.md`。
