@@ -2,7 +2,7 @@
 
 版本 **0.3.1**。协议参照固定的 **Xray-core v26.11.9**，编译工具链固定为 **Rust 1.100.0**，依赖通过 `Cargo.lock` 锁定。进程自身完成加密握手、记录层和转发，不启动或嵌入 Go Xray。
 
-当前功能均以 opt-in 方式启用；尚未经过独立安全审计。普通 Encryption 基线和后续实验功能的验证范围分别记录于 [VALIDATION.md](VALIDATION.md)。当前记录包含 Debian 13 上 v0.3.1 候选的 systemd 三节点及 NVIDIA target smoke；该次临时节点已删除并恢复原 0.2.0 安装。长时间运行、移动网络、其他公网目标和完整 fingerprint parity 尚未验证；off-host 入站测试未做。
+当前功能均以 opt-in 方式启用；v0.3.1 已发布，但尚未经过独立安全审计。普通 Encryption 基线和后续实验功能的验证范围分别记录于 [VALIDATION.md](VALIDATION.md)。Debian 13 上的 v0.3.1 systemd 三节点及 NVIDIA target smoke 已完成；临时节点已删除并恢复原 0.2.0 安装。长时间运行、移动网络、其他公网目标和完整 fingerprint parity 尚未验证；off-host 入站测试未做。
 
 ## 已支持的范围
 

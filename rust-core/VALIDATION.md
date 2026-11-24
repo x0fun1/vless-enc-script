@@ -49,7 +49,7 @@ python3 rust-core/tools/benchmark.py
 
 截至 2026-11-24，后续工作树以官方 Xray-core v26.11.9 验证 Vision + REALITY 组合。上游 VLESS Vision outbound 可在 REALITY transport 上运行；本实现曾错误地在配置校验中拒绝组合，现已移除该限制。测试目标均为 Windows localhost TLS echo / echo 服务，不代表公网或 Debian 生产环境。
 
-- 最新 Rust 本地检查：vless-rust **0.3.1 候选**，29 项 Rust tests、strict Clippy、`cargo build --release --locked` 均通过。Windows 的完整互通矩阵针对当前候选重新运行通过。
+- 最新 Rust 本地检查：vless-rust **0.3.1**，29 项 Rust tests、strict Clippy、`cargo build --release --locked` 均通过。Windows 的完整互通矩阵针对最终源代码重新运行通过。
 - 全量普通 Encryption 互通 `python tools/interop.py`：30 个官方 Xray 客户端变体通过；八层混合认证 relay-only 另 6 个通过。
 - `python tools/interop.py --quick --reality` 现验证 metadata probe 的平台证书信任和 SNI：测试 CA 签发的 localhost target 正向成功；替换为不相关但有效的 CA 时，服务端报告 `UnknownIssuer`，且代理流未建立。
 - `python tools/interop.py --reality --vision`：30 个官方 Xray 变体全通过，覆盖 X25519 / ML-KEM-768、native / xorpub / random、AES / ChaCha、Mux 开 / 关及无 Mux XUDP 用例。random 外观在 Vision Direct 后继续对 TLS record header 使用 Xray 对应的 CTR mask；完整矩阵通过了 TLS echo 与 TCP/UDP 流量。
@@ -66,12 +66,12 @@ REALITY 指纹捕获仍仅涵盖完整 ServerHello 位于单个 TLS record、兼
 
 主机：Debian GNU/Linux 13 (trixie) x86_64，kernel `6.12.95+deb13-cloud-amd64`；Rust/Cargo `1.100.0`。服务器可解析并连接 `www.nvidia.com:443`。
 
-- Debian 上 `cargo fmt -- --check`、29 项 `cargo test --locked`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --release --locked` 均通过；另以 Rust 1.89.0 `cargo check --locked --offline` 验证声明的最低 Rust 版本。v0.3.1 候选 release SHA-256：`0004f93892c0cbcbd7c2aa63b726882c9c1d5d7050b001f18e37a913a99fb6df`。
+- Debian 上 `cargo fmt -- --check`、29 项 `cargo test --locked`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --release --locked` 均通过；另以 Rust 1.89.0 `cargo check --locked --offline` 验证声明的最低 Rust 版本。Debian 本地 release build SHA-256：`0004f93892c0cbcbd7c2aa63b726882c9c1d5d7050b001f18e37a913a99fb6df`。
 - `python3 tools/regression.py` 14 项、`python3 tests/regression.py` 16 项通过。
 - 官方 Xray v26.11.9：普通 Encryption 30 项、8 层 relay 6 项、REALITY + Vision 全量 30 项通过。REALITY + Vision + ML-DSA-65 的 native / random quick matrix 共 8 项通过，正确公钥验证成功、错误公钥返回 `BadCertificate`。独立 REALITY Chrome / Firefox / Safari 快速用例均通过；不受信任自定义 target CA 用例返回 `UnknownIssuer` 且无代理流量。
-- 使用真实菜单分别创建三类 systemd 节点：普通 Encryption、X25519 REALITY + Vision、ML-KEM-768 REALITY + Vision + 可选 ML-DSA-65。官方 Xray 客户端通过各服务访问真实 `www.nvidia.com`，三者均完成 HTTPS 请求（HTTP 307）；ML-DSA 客户端记录 `uConn.Verified: true`。
-- 默认 NVIDIA 目标的 systemd 日志出现 `sni_ack=true`、`server_hello_match=true`，ServerHello 后的记录长度与捕获值匹配。REALITY target metadata probe 会校验系统信任根和 SNI 主机名；测试 / 私有目标的自定义信任锚通过 `target_ca_certificates` 显式提供。Xray 关闭连接时未发送 TLS `close_notify`，rustls 因此记录 `UnexpectedEof`；HTTP 请求已成功，但此类关闭仍计入服务 `errors`。
-- 本候选 v0.3.1 在 Debian 13 上重新通过上述 build / regression / interop 矩阵。release 二进制 SHA-256 为 `0004f93892c0cbcbd7c2aa63b726882c9c1d5d7050b001f18e37a913a99fb6df`；应用与 vendored rustls 锁文件 SHA-256 分别为 `949886f3205f6919061a64ed3c30f8f5f5e05d30f87daa7316cc0770d2b3fc3c`、`c845884bb7c73dc3384198d0f91584f03dd337ba197cd2c23d6ed51a71f7aa0f`。systemd 上由真实菜单创建三个 v0.3.1 候选节点；官方 Xray 分别访问真实 NVIDIA 目标取得 HTTP 307。使用当前候选再次安装后，三份配置 SHA-256 不变且服务均仍 active；随后删除临时节点、确认测试端口关闭、恢复原 0.2.0 core / manager / unit。原有 `x-ui` 服务仍 active，未改动。此为本机客户端到服务器、经公网目标的 smoke，不是 off-host 入站测试。
+- 上一轮 v0.3.0 安装基线中，真实菜单创建过三类 systemd 节点；官方 Xray 经各服务访问真实 `www.nvidia.com` 均完成 HTTPS（HTTP 307），ML-DSA 客户端日志记有 `uConn.Verified: true`。该轮目标日志还观察到 `sni_ack=true`、`server_hello_match=true` 和匹配的初始记录长度。Xray 未发送 TLS `close_notify`，rustls 因而记录 `UnexpectedEof`；成功的 HTTP 不代表 TLS 正常关闭。
+- v0.3.1 在 Debian systemd 上由真实菜单创建了普通 Encryption、X25519 REALITY + Vision、ML-KEM-768 REALITY + Vision + ML-DSA-65 三节点；本机官方 Xray 分别访问 NVIDIA 目标取得 HTTP 307。重新安装 v0.3.1 后配置哈希不变、服务保持 active；随后清除临时节点并恢复原 0.2.0 core / manager / unit。
+- 已发布 `vless-rust-v0.3.1`，对应源代码 commit `139f908ab1536bbf10ca8a10f658133cbfe0049b`；Actions run [45318051503](https://github.com/x0fun1/vless-enc-script/actions/runs/45318051503) 成功。GitHub Release 同时提供 x86_64 / aarch64 核心、`venc`、部署包及各自 SHA-256 sidecar。下载后校验的 SHA-256：x86_64 `9d615b518399b3fa112a9fc40491878d894a19fb4ab209742952f96df28ef40f`；aarch64 `8bab1f1d6d63285cfad949f889b1366cc592721e7711948eb1b6b4d2f723127a`；venc `ff7200ff9421b3482072180493301fffe0e6d23426642b62ed2274336cf641a2`；deployment bundle `a0612f8d58a3d5feb824b92818271b9fd18905b7ce5c4043fb83db29caaf1b89`。部署包归档条目检查通过。
 
 本次自动化安全依赖检查：cargo-audit v0.23.0 对应用锁文件（131 个依赖）及 vendored rustls 锁文件（134 个依赖）分别扫描，均无告警 / advisories。RustSec advisory database commit `52384ab5581a4487b62c549eef95cf7ba7e8bad5`（2026-11-23）；扫描未使用 ignore。主构建解析 rustls-webpki 0.103.17；vendor lock 中 rustls-webpki 0.103.17、webpki-roots 1.0.10。RUSTSEC-2024-0437 的 protobuf 不在这两个依赖图中。
 
