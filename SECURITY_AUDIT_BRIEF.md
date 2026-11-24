@@ -5,8 +5,8 @@
 ## Exact review target
 
 - Published baseline: `vless-rust-v0.3.1`, source commit `139f908ab1536bbf10ca8a10f658133cbfe0049b`.
-- Current un-released candidate: `fc534857ed817982aa5b56db5786e40f1f5e2ecf` (`fix: handle fragmented Vision direct transitions and truncation`), based on published main HEAD `b466bf7e51fbf9045826ebbad41972e15bffd14d`.
-- The candidate is on local branch `security/vision-fragment-eof`; it has **not** been pushed or released. Rust package version metadata still says 0.3.1, so the candidate must not be mistaken for the released 0.3.1 binary.
+- Current un-released candidate: `854802705e1be47edb096e5187d81e1d69d766ec` on local branch `security/vision-fragment-eof`. It includes the direct-truncation/fragmented-ServerHello patch `fc534857ed817982aa5b56db5786e40f1f5e2ecf` and follow-up ClientHello filter-budget fix `854802705e1be47edb096e5187d81e1d69d766ec`, based on published main HEAD `b466bf7e51fbf9045826ebbad41972e15bffd14d`.
+- The candidate is **not pushed or released**. Rust package version metadata still says 0.3.1, so the candidate must not be mistaken for the released 0.3.1 binary.
 - Interoperability reference is pinned Xray-core v26.11.9, source `676eaf66f8f05d4d558ee7a74b4736623d3feeb9`.
 
 The reviewer should obtain the repository at the exact candidate commit and state whether the review covers the full tree or only the delta. For a release decision, review the full tree, including the vendored rustls modifications, and not only the two files in the latest patch.
@@ -26,7 +26,7 @@ The reviewer should obtain the repository at the exact candidate commit and stat
    - Allocation and CPU bounds under malformed or deliberately slow client/target traffic.
 4. **Vision state and direct forwarding**
    - Addons/Continue/End/Direct state transitions in both directions, random-appearance TLS record-header masking, partial reads/writes, half-close, clean EOF, truncated record/body/header behavior and Mux interactions.
-   - The candidate adds complete-record truncation errors and fragmented ServerHello detection; these changes need independent review as well as retest.
+   - The candidate adds truncated direct-record EOF errors, fragmented ClientHello/ServerHello sniffing, and deterministic synthetic bidirectional Direct tests; these changes need independent review as well as retest.
 5. **Target and network boundaries**
    - DNS resolution/rebinding assumptions, listener self-target checks, private-destination filtering, custom target CA trust, certificate/SNI validation of the separate metadata probe, fallback relay behavior, timeouts and cache keys/expiry.
    - Confirm that the capture connection and metadata-probe connection cannot be redirected to unsafe or unexpected endpoints.
@@ -41,7 +41,7 @@ The project has **not** established complete TLS fingerprint parity, arbitrary-t
 
 ## Available maintainer evidence (not independent assurance)
 
-For the v0.3.1 release, `rust-core/VALIDATION.md` records Windows and Debian 13 tests, official Xray-core v26.11.9 interoperability, dependency scans and a systemd smoke. The current candidate has Windows results: 34 Rust tests, strict Clippy, locked release build, 14 core regressions, 16 deployment regressions, 30 REALITY+Vision Xray variants, 30 plain Vision Xray variants, and ML-DSA-65 random/native subsets. New deterministic tests exercise both synthetic Direct directions, fragmented ServerHello boundaries, masked fragmented Direct record headers, clean EOF and truncated headers/bodies.
+For the v0.3.1 release, `rust-core/VALIDATION.md` records Windows and Debian 13 tests, official Xray-core v26.11.9 interoperability, dependency scans and a systemd smoke. The current candidate has Windows results: 34 Rust tests, strict Clippy, locked release build, 14 core regressions, 16 deployment regressions, 30 REALITY+Vision Xray variants, 30 plain Vision Xray variants, and native/random ML-DSA-65 subsets. Chrome/Firefox/Safari REALITY quick cases passed. New deterministic tests exercise both synthetic Direct directions, fragmented ClientHello/ServerHello boundaries, masked fragmented Direct record headers, clean EOF and truncated headers/bodies.
 
 **The candidate has not been re-run on Debian or systemd**, and GitHub CI has not run for this local branch. No dependency lockfile changed in this candidate. The previous `cargo-audit` v0.23.0 scans of both lockfiles are dependency-advisory scans only; they do not cover project code or protocol design.
 

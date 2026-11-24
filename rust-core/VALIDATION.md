@@ -79,10 +79,10 @@ REALITY 指纹捕获仍仅涵盖完整 ServerHello 位于单个 TLS record、兼
 
 ## v0.3.1 发布后的未发布 Vision 补丁（Windows 本地验证）
 
-候选 commit `fc534857ed817982aa5b56db5786e40f1f5e2ecf` 位于本地分支 `security/vision-fragment-eof`，基于已发布 main commit `b466bf7e51fbf9045826ebbad41972e15bffd14d`。它**尚未推送、尚未发布，也没有 Debian/CI 验证**；包版本仍显示 0.3.1，不能将其与 0.3.1 发布二进制混为一谈。
+候选代码为 `fc534857ed817982aa5b56db5786e40f1f5e2ecf` 与后续 Vision parser fix `854802705e1be47edb096e5187d81e1d69d766ec`，位于本地分支 `security/vision-fragment-eof`，基于已发布 main commit `b466bf7e51fbf9045826ebbad41972e15bffd14d`。它**尚未推送、尚未发布，也没有 Debian/CI 验证**；包版本仍显示 0.3.1，不能将其与 0.3.1 发布二进制混为一谈。
 
 - `Reader::read_direct()` 在已开始的 TLS record body 处遇到 EOF 时，现返回截断错误而非把截断记录视为干净 EOF。
-- Vision ServerHello 检测现在可跨 TLS header / record 的读分片累计最多一个受限 ServerHello record，并累计其 supported_versions 扩展；测试覆盖每个二分边界、逐字节切分及不允许直接切换的 ChaCha TLS suite。
+- Vision ServerHello 检测现在可跨 TLS header / record 的读分片累计最多一个受限 ServerHello record，并累计其 supported_versions 扩展；ClientHello 抓取会覆盖分片并为响应 ServerHello 保留有界检测预算。测试覆盖每个二分边界、逐字节 ClientHello/ServerHello 切分及不允许直接切换的 ChaCha TLS suite。
 - 新的 record-layer 双端合成测试经带 header masking 的加密记录进入 Direct，确认 uplink 与 downlink 状态切换、分片 TLS record header 的传输、record 边界上的 clean half-close，以及两方向的 header/body 截断报错。它证明实现路径受测，不代表官方客户端实际产生双向 Direct。
 - Windows 候选验证：34 项 Rust tests、strict Clippy、locked release build、核心 14 项和部署 16 项回归通过；官方 Xray 26.11.9 的 REALITY+Vision 30 变体、plain Vision 30 变体，以及 ML-DSA-65 native/random 子集互通通过。Chrome/Firefox/Safari REALITY quick 用例通过。
 - 官方 Xray 实际系统日志仍只观察到个别连接的 downlink Direct 转换，uplink Direct 计数仍为 0；Mux 示例没有 Direct 转换。合成双向测试不能替代真实双向互通证据，因此仍不宣称 Vision 双向 Direct parity。
