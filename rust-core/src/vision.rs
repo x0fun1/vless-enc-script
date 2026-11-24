@@ -28,6 +28,7 @@ struct Traffic {
     is_tls: bool,
     is_tls12_or_above: bool,
     enable_direct: bool,
+    remaining_client_hello: usize,
     remaining_server_hello: i32,
     server_hello_capture: Vec<u8>,
     tls_tail: Vec<u8>,
@@ -41,6 +42,7 @@ impl Default for Traffic {
             is_tls: false,
             is_tls12_or_above: false,
             enable_direct: false,
+            remaining_client_hello: 0,
             remaining_server_hello: 0,
             server_hello_capture: Vec::new(),
             tls_tail: Vec::with_capacity(5),
@@ -81,8 +83,9 @@ impl SharedState {
     fn inspect(&self, bytes: &[u8]) -> (bool, bool, bool) {
         let mut state = self.0.lock().expect("Vision state mutex poisoned");
         let capturing_server_hello = state.remaining_server_hello > 0;
-        if state.packets_to_filter > 0 || capturing_server_hello {
-            if !capturing_server_hello && state.packets_to_filter > 0 {
+        let capturing_client_hello = state.remaining_client_hello > 0;
+        if state.packets_to_filter > 0 || capturing_server_hello || capturing_client_hello {
+            if !capturing_server_hello && !capturing_client_hello && state.packets_to_filter > 0 {
                 state.packets_to_filter -= 1;
             }
 
@@ -90,17 +93,36 @@ impl SharedState {
                 let take = (state.remaining_server_hello as usize).min(bytes.len());
                 state.server_hello_capture.extend_from_slice(&bytes[..take]);
                 state.remaining_server_hello -= take as i32;
+            } else if capturing_client_hello {
+                let take = state.remaining_client_hello.min(bytes.len());
+                state.remaining_client_hello -= take;
+                let mut joined = std::mem::take(&mut state.tls_tail);
+                joined.extend_from_slice(bytes);
+                let keep = joined.len().min(5);
+                state
+                    .tls_tail
+                    .extend_from_slice(&joined[joined.len() - keep..]);
             } else {
                 let tail_len = state.tls_tail.len();
                 let mut joined = std::mem::take(&mut state.tls_tail);
                 joined.extend_from_slice(bytes);
 
                 if joined.len() >= 6 && joined[..2] == [0x16, 0x03] && joined[5] == 0x01 {
-                    state.is_tls = true;
+                    let record_length = u16::from_be_bytes([joined[3], joined[4]]) as usize;
+                    if (4..=16_384).contains(&record_length) {
+                        if !state.is_tls {
+                            state.remaining_client_hello =
+                                (5 + record_length).saturating_sub(joined.len());
+                            state.packets_to_filter = FILTER_PACKETS;
+                        }
+                        state.is_tls = true;
+                    }
                 }
 
-                let candidate = (0..=tail_len.min(joined.len().saturating_sub(6))).find(|&start| {
-                    joined[start..start + 3] == [0x16, 0x03, 0x03] && joined[start + 5] == 0x02
+                let candidate = joined.len().checked_sub(6).and_then(|max_start| {
+                    (0..=tail_len.min(max_start)).find(|&start| {
+                        joined[start..start + 3] == [0x16, 0x03, 0x03] && joined[start + 5] == 0x02
+                    })
                 });
                 if let Some(start) = candidate {
                     let record_length =
@@ -512,6 +534,19 @@ mod tests {
         assert!(
             state.inspect(&[]).2,
             "one-byte TLS fragments did not enable Direct"
+        );
+
+        let state = SharedState::new();
+        let client_hello = [0x16, 0x03, 0x01, 0, 4, 1, 0, 0, 0];
+        for byte in &client_hello {
+            state.inspect(std::slice::from_ref(byte));
+        }
+        for byte in &hello {
+            state.inspect(std::slice::from_ref(byte));
+        }
+        assert!(
+            state.inspect(&[]).2,
+            "one-byte ClientHello and ServerHello fragments did not enable Direct"
         );
 
         let chacha = server_hello(0x1305);
