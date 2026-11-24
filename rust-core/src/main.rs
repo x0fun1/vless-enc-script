@@ -388,7 +388,7 @@ fn import_xray_config(
     let config = Config {
         listen: SocketAddr::new(listen_host, port.unwrap_or(original_port as u16)),
         users: migrated_users,
-        decryption: original_decryption.to_owned(),
+        decryption: Zeroizing::new(original_decryption.to_owned()),
         vision: imported_flow.unwrap_or(default_flow) == "xtls-rprx-vision",
         reality: None,
         limits: Limits::default(),
@@ -678,7 +678,7 @@ fn main() -> Result<()> {
             let config = Config {
                 listen: SocketAddr::new(listen_host.unwrap_or("::".parse()?), port.unwrap_or(443)),
                 users: vec![uuid],
-                decryption,
+                decryption: Zeroizing::new(decryption),
                 vision: vision_setting.unwrap_or(false),
                 reality: if use_reality {
                     let name = server_name.unwrap_or_else(|| "www.nvidia.com".to_owned());
@@ -730,7 +730,7 @@ fn main() -> Result<()> {
                 "changing auth or mode requires --rekey"
             );
             if rekey {
-                config.decryption = keypair(new_auth, new_mode)?.0;
+                config.decryption = Zeroizing::new(keypair(new_auth, new_mode)?.0);
             }
             config.listen = SocketAddr::new(
                 listen_host.unwrap_or(config.listen.ip()),

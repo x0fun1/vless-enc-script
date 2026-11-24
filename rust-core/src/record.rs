@@ -23,6 +23,17 @@ fn direct_record_length(header: &[u8; 5]) -> Result<usize> {
     Ok(length)
 }
 
+fn encode_direct_header(mask: &mut Option<HeaderMask>, header: &mut [u8; 5]) -> Result<usize> {
+    let length = direct_record_length(header)?;
+    mask_header(mask, header);
+    Ok(length)
+}
+
+fn decode_direct_header(mask: &mut Option<HeaderMask>, header: &mut [u8; 5]) -> Result<usize> {
+    mask_header(mask, header);
+    direct_record_length(header)
+}
+
 pub struct Reader {
     socket: Box<dyn AsyncRead + Unpin + Send>,
     cipher: Aead,
@@ -89,8 +100,8 @@ impl Reader {
                     .read_exact(&mut self.direct_header[self.direct_header_len..])
                     .await?;
                 self.direct_header_len = 5;
-                self.direct_body_remaining = direct_record_length(&self.direct_header)?;
-                mask_header(&mut self.mask, &mut self.direct_header);
+                self.direct_body_remaining =
+                    decode_direct_header(&mut self.mask, &mut self.direct_header)?;
             }
             if self.direct_header_offset < self.direct_header_len {
                 let n = (output.len() - written)
@@ -261,8 +272,8 @@ impl Writer {
             if self.direct_header_len < 5 {
                 break;
             }
-            self.direct_body_remaining = direct_record_length(&self.direct_header)?;
-            mask_header(&mut self.mask, &mut self.direct_header);
+            self.direct_body_remaining =
+                encode_direct_header(&mut self.mask, &mut self.direct_header)?;
             output.extend_from_slice(&self.direct_header);
             self.direct_header_len = 0;
         }
@@ -374,6 +385,30 @@ mod tests {
                 blake3::derive_key(&context, &material)
             );
         }
+    }
+
+    #[test]
+    fn random_appearance_direct_header_masks_and_unmasks_roundtrip() {
+        use crate::crypto::header_mask;
+
+        let header = [23, 3, 3, 0, 32];
+        let key = [0x7b; 32];
+        let iv = [0x31; 16];
+        let mut encoder = Some(header_mask(&key, &iv));
+        let mut wire = header;
+        assert_eq!(encode_direct_header(&mut encoder, &mut wire).unwrap(), 32);
+        assert_ne!(wire, header);
+
+        let mut decoder = Some(header_mask(&key, &iv));
+        assert_eq!(decode_direct_header(&mut decoder, &mut wire).unwrap(), 32);
+        assert_eq!(wire, header);
+    }
+
+    #[test]
+    fn direct_tls_record_header_rejects_invalid_type_and_length() {
+        assert!(direct_record_length(&[22, 3, 3, 0, 32]).is_err());
+        assert!(direct_record_length(&[23, 3, 3, 0, 16]).is_err());
+        assert!(direct_record_length(&[23, 3, 3, 0x41, 1]).is_err());
     }
 
     #[tokio::test]

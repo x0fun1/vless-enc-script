@@ -39,7 +39,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::TcpStream,
+    net::{TcpStream, lookup_host},
     time::timeout,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, server::TlsStream};
@@ -49,14 +49,16 @@ use zeroize::Zeroizing;
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RealityConfig {
-    pub private_key: String,
+    pub private_key: Zeroizing<String>,
     pub short_id: String,
     #[serde(default = "default_spider_x")]
     pub spider_x: String,
     pub server_name: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_ca_certificates: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mldsa65_seed: Option<String>,
+    pub mldsa65_seed: Option<Zeroizing<String>>,
     #[serde(default = "default_time_diff")]
     pub max_time_diff_secs: u64,
 }
@@ -76,11 +78,12 @@ impl RealityConfig {
         OsRng.fill_bytes(&mut sid);
         OsRng.fill_bytes(&mut spider_bytes);
         let config = Self {
-            private_key: URL_SAFE_NO_PAD.encode(*key),
+            private_key: Zeroizing::new(URL_SAFE_NO_PAD.encode(*key)),
             short_id: sid.iter().map(|b| format!("{b:02x}")).collect(),
             spider_x: format!("/{}", URL_SAFE_NO_PAD.encode(spider_bytes)),
             server_name,
             target,
+            target_ca_certificates: Vec::new(),
             mldsa65_seed: None,
             max_time_diff_secs: default_time_diff(),
         };
@@ -97,7 +100,7 @@ impl RealityConfig {
         if enabled {
             let mut seed = Zeroizing::new([0u8; 32]);
             OsRng.fill_bytes(&mut *seed);
-            config.mldsa65_seed = Some(URL_SAFE_NO_PAD.encode(*seed));
+            config.mldsa65_seed = Some(Zeroizing::new(URL_SAFE_NO_PAD.encode(*seed)));
         }
         config.validate()?;
         Ok(config)
@@ -107,7 +110,7 @@ impl RealityConfig {
         if self.mldsa65_seed.is_none() {
             let mut seed = Zeroizing::new([0u8; 32]);
             OsRng.fill_bytes(&mut *seed);
-            self.mldsa65_seed = Some(URL_SAFE_NO_PAD.encode(*seed));
+            self.mldsa65_seed = Some(Zeroizing::new(URL_SAFE_NO_PAD.encode(*seed)));
         }
         self.validate()
     }
@@ -120,9 +123,11 @@ impl RealityConfig {
         let Some(seed) = &self.mldsa65_seed else {
             return Ok(None);
         };
-        let seed = URL_SAFE_NO_PAD
-            .decode(seed)
-            .context("invalid ML-DSA-65 seed encoding")?;
+        let seed = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(seed)
+                .context("invalid ML-DSA-65 seed encoding")?,
+        );
         ensure!(seed.len() == 32, "ML-DSA-65 seed must be 32 bytes");
         let key = MlDsaSigningKey::<MlDsa65>::from_seed(&MlDsaSeed::from(<[u8; 32]>::try_from(
             seed.as_slice(),
@@ -134,9 +139,11 @@ impl RealityConfig {
         let Some(seed) = &self.mldsa65_seed else {
             return Ok(None);
         };
-        let seed = URL_SAFE_NO_PAD
-            .decode(seed)
-            .context("invalid ML-DSA-65 seed encoding")?;
+        let seed = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(seed)
+                .context("invalid ML-DSA-65 seed encoding")?,
+        );
         ensure!(seed.len() == 32, "ML-DSA-65 seed must be 32 bytes");
         Ok(Some(MlDsaSigningKey::<MlDsa65>::from_seed(
             &MlDsaSeed::from(<[u8; 32]>::try_from(seed.as_slice())?),
@@ -151,9 +158,11 @@ impl RealityConfig {
                 seed != &self.private_key,
                 "ML-DSA-65 seed must differ from the REALITY private key"
             );
-            let bytes = URL_SAFE_NO_PAD
-                .decode(seed)
-                .context("invalid ML-DSA-65 seed encoding")?;
+            let bytes = Zeroizing::new(
+                URL_SAFE_NO_PAD
+                    .decode(seed)
+                    .context("invalid ML-DSA-65 seed encoding")?,
+            );
             ensure!(bytes.len() == 32, "ML-DSA-65 seed must be 32 bytes");
         }
         ensure!(
@@ -185,6 +194,23 @@ impl RealityConfig {
                 && port.parse::<u16>().is_ok_and(|p| p != 0),
             "invalid REALITY target"
         );
+        ensure!(
+            self.target_ca_certificates.len() <= 16,
+            "REALITY target_ca_certificates must contain at most 16 DER certificates"
+        );
+        for encoded in &self.target_ca_certificates {
+            let der = URL_SAFE_NO_PAD
+                .decode(encoded)
+                .context("invalid REALITY target root certificate encoding")?;
+            ensure!(
+                (64..=16_384).contains(&der.len()),
+                "REALITY target root certificate must be 64..16384 DER bytes"
+            );
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(CertificateDer::from(der))
+                .context("invalid REALITY target root certificate")?;
+        }
         ensure!(
             (1..=3600).contains(&self.max_time_diff_secs),
             "REALITY max_time_diff_secs must be 1..3600"
@@ -267,6 +293,8 @@ impl SupportedKxGroup for HybridGroup {
     }
 }
 
+type TargetProfileKey = (SocketAddr, Vec<u8>, Vec<Vec<u8>>);
+
 pub struct Server {
     config: RealityConfig,
     secret: StaticSecret,
@@ -276,7 +304,7 @@ pub struct Server {
     mldsa_signing_key: Option<MlDsaSigningKey<MlDsa65>>,
     seen: Mutex<HashMap<[u8; 32], Instant>>,
     max_seen: usize,
-    target_profile_cache: Mutex<HashMap<Vec<Vec<u8>>, TargetTlsProfile>>,
+    target_profile_cache: Mutex<HashMap<TargetProfileKey, TargetTlsProfile>>,
     listen: std::net::SocketAddr,
 }
 
@@ -441,22 +469,56 @@ impl Server {
             && (same_ip(target.ip(), accepted_local.ip())
                 || (self.listen.ip().is_unspecified() && loopback(target.ip())))
     }
+    async fn connect_target(&self, accepted_local: SocketAddr) -> Result<TcpStream> {
+        let mut addresses = timeout(Duration::from_secs(3), lookup_host(&self.config.target))
+            .await
+            .context("REALITY target DNS lookup timed out")??
+            .take(64);
+        let mut candidates = Vec::new();
+        for address in &mut addresses {
+            ensure!(
+                !self.is_listener_target(address, accepted_local),
+                "REALITY target cannot point to this listener"
+            );
+            candidates.push(address);
+        }
+        ensure!(
+            !candidates.is_empty(),
+            "REALITY target DNS returned no addresses"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut last_error = None;
+        for address in candidates {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(remaining, TcpStream::connect(address)).await {
+                Ok(Ok(socket)) => return Ok(socket),
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => {
+                    last_error = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "REALITY target connect budget exhausted",
+                    ));
+                    break;
+                }
+            }
+        }
+        Err(last_error.context("connect REALITY target failed")?.into())
+    }
+
     pub async fn accept(&self, mut socket: TcpStream) -> Result<Option<TlsStream<Replay>>> {
         let (prefix, hello) = read_hello(&mut socket).await?;
         let auth = hello
             .as_deref()
             .and_then(|hello| self.authenticate(hello).ok());
         let Some(auth) = auth else {
-            let mut target = timeout(
-                Duration::from_secs(10),
-                TcpStream::connect(&self.config.target),
-            )
-            .await
-            .context("connect REALITY fallback target timed out")??;
-            ensure!(
-                !self.is_listener_target(target.peer_addr()?, socket.local_addr()?),
-                "REALITY target cannot point to this listener"
-            );
+            let mut target = self
+                .connect_target(socket.local_addr()?)
+                .await
+                .context("connect REALITY fallback target")?;
             timeout(Duration::from_secs(10), target.write_all(&prefix))
                 .await
                 .context("write REALITY fallback ClientHello timed out")??;
@@ -469,19 +531,14 @@ impl Server {
         let parsed_client_hello = Hello::parse(&client_hello)?;
         let cert_body = cert_body(&self.cert_public, None);
         let certified = certificate(&cert_body, &auth, &self.cert_public, &self.signing_key);
-        let mut target = timeout(
-            Duration::from_secs(10),
-            TcpStream::connect(&self.config.target),
-        )
-        .await
-        .context("connect REALITY fingerprint target timed out")??;
-        ensure!(
-            !self.is_listener_target(target.peer_addr()?, socket.local_addr()?),
-            "REALITY target cannot point to this listener"
-        );
+        let mut target = self
+            .connect_target(socket.local_addr()?)
+            .await
+            .context("connect REALITY fingerprint target")?;
         timeout(Duration::from_secs(10), target.write_all(&prefix))
             .await
             .context("write REALITY fingerprint ClientHello timed out")??;
+        let target_address = target.peer_addr()?;
         let fingerprint = timeout(
             Duration::from_secs(10),
             read_target_fingerprint(&mut target),
@@ -489,7 +546,11 @@ impl Server {
         .await
         .context("REALITY fingerprint target handshake timed out")??;
         drop(target);
-        let target_profile_key = parsed_client_hello.alpn.clone();
+        let target_profile_key = (
+            target_address,
+            parsed_client_hello.server_name.to_vec(),
+            parsed_client_hello.alpn.clone(),
+        );
         let cached_profile = {
             let mut cache = self
                 .target_profile_cache
@@ -504,9 +565,10 @@ impl Server {
                 let profile = timeout(
                     Duration::from_secs(10),
                     probe_target_alpn(
-                        &self.config.target,
+                        target_address,
                         std::str::from_utf8(parsed_client_hello.server_name)?,
                         &parsed_client_hello.alpn,
+                        &self.config.target_ca_certificates,
                     ),
                 )
                 .await
@@ -691,6 +753,12 @@ impl<'a> Hello<'a> {
             hello.len() >= 71 && hello[0] == 1 && hello[38] == 32,
             "invalid REALITY ClientHello/session ID"
         );
+        let declared =
+            4 + ((hello[1] as usize) << 16 | (hello[2] as usize) << 8 | hello[3] as usize);
+        ensure!(
+            declared == hello.len(),
+            "truncated or trailing REALITY ClientHello bytes"
+        );
         let mut cursor = Cursor(&hello[71..]);
         cursor.vector()?;
         let n = cursor.u8()?;
@@ -716,6 +784,10 @@ impl<'a> Hello<'a> {
                             server_name = Some(name.0);
                         }
                     }
+                    ensure!(
+                        value.0.is_empty(),
+                        "trailing bytes in server_name extension"
+                    );
                 }
                 16 => {
                     let mut protocols = value.vector()?;
@@ -724,6 +796,7 @@ impl<'a> Hello<'a> {
                         ensure!(length > 0, "empty ALPN protocol name");
                         alpn.push(protocols.take(length)?.to_vec());
                     }
+                    ensure!(value.0.is_empty(), "trailing bytes in ALPN extension");
                 }
                 51 => {
                     let mut shares = value.vector()?;
@@ -731,11 +804,18 @@ impl<'a> Hello<'a> {
                         let group = shares.u16()?;
                         let key = shares.vector()?;
                         match (group, key.0.len()) {
-                            (29, 32) => peers.push(key.0.try_into()?),
-                            (4588, 1216) => peers.push(key.0[1184..].try_into()?),
+                            (29, 32) => {
+                                ensure!(peers.len() < 8, "too many REALITY X25519 key shares");
+                                peers.push(key.0.try_into()?);
+                            }
+                            (4588, 1216) => {
+                                ensure!(peers.len() < 8, "too many REALITY hybrid key shares");
+                                peers.push(key.0[1184..].try_into()?);
+                            }
                             _ => {}
                         }
                     }
+                    ensure!(value.0.is_empty(), "trailing bytes in key_share extension");
                 }
                 _ => {}
             }
@@ -780,49 +860,6 @@ async fn read_hello(socket: &mut TcpStream) -> Result<(Vec<u8>, Option<Vec<u8>>)
     }
 }
 
-#[derive(Debug)]
-// Used only by the short-lived metadata probe; it sends no application data to the target.
-struct TargetCertificateVerifier;
-impl rustls::client::danger::ServerCertVerifier for TargetCertificateVerifier {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-        ]
-    }
-}
-
 #[derive(Clone)]
 struct TargetTlsProfile {
     alpn: Option<Vec<u8>>,
@@ -831,15 +868,30 @@ struct TargetTlsProfile {
 }
 
 async fn probe_target_alpn(
-    target: &str,
+    target: SocketAddr,
     server_name: &str,
     protocols: &[Vec<u8>],
+    custom_roots: &[String],
 ) -> Result<TargetTlsProfile> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    let (loaded, _ignored) = roots.add_parsable_certificates(native.certs);
+    ensure!(
+        loaded > 0,
+        "no usable platform root certificates for REALITY target probe"
+    );
+    for encoded in custom_roots {
+        let der = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .context("decode configured REALITY target root certificate")?;
+        roots
+            .add(CertificateDer::from(der))
+            .context("add configured REALITY target root certificate")?;
+    }
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TargetCertificateVerifier))
+        .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = protocols.to_vec();
     config.resumption = rustls::client::Resumption::disabled();
@@ -848,7 +900,7 @@ async fn probe_target_alpn(
     let tls = TlsConnector::from(Arc::new(config))
         .connect(name, socket)
         .await
-        .context("probe REALITY target ALPN")?;
+        .context("verify REALITY target certificate during ALPN probe")?;
     Ok(TargetTlsProfile {
         alpn: tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec),
         server_name_ack: tls
@@ -1157,6 +1209,7 @@ impl AsyncWrite for Replay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
     use tokio::net::TcpListener;
     #[test]
     fn mldsa65_seed_derives_a_fixed_size_verification_key_and_signature() {
@@ -1205,6 +1258,9 @@ mod tests {
         c.short_id = "123".into();
         assert!(c.validate().is_err());
         c.short_id = "abcd".into();
+        c.target_ca_certificates = vec!["not-base64url!".into()];
+        assert!(c.validate().is_err());
+        c.target_ca_certificates.clear();
         c.max_time_diff_secs = 0;
         assert!(c.validate().is_err());
     }
@@ -1302,6 +1358,32 @@ mod tests {
         assert!(server.is_listener_target("127.0.0.1:443".parse().unwrap(), accepted));
         assert!(server.is_listener_target("192.0.2.10:443".parse().unwrap(), accepted));
         assert!(!server.is_listener_target("198.51.100.10:443".parse().unwrap(), accepted));
+    }
+
+    #[tokio::test]
+    async fn reality_target_loop_is_rejected_before_a_socket_is_opened() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let actual = listener.local_addr().unwrap();
+        let config =
+            RealityConfig::generate("example.com".into(), format!("127.0.0.1:{}", actual.port()))
+                .unwrap();
+        let server = Server::new(
+            config,
+            1,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), actual.port()),
+        )
+        .unwrap();
+        assert!(
+            server
+                .connect_target("192.0.2.7:42000".parse().unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1409,6 +1491,19 @@ mod tests {
 
     #[test]
     fn truncated_hello_never_panics() {
+        let config =
+            RealityConfig::generate("example.com".into(), "example.com:443".into()).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let valid = authenticated_hello(&config, now, config.sid().unwrap());
+        for end in 0..valid.len() {
+            assert!(
+                Hello::parse(&valid[..end]).is_err(),
+                "accepted truncated hello length {end}"
+            );
+        }
         for n in 0..256 {
             assert!(Hello::parse(&vec![0; n]).is_err());
         }

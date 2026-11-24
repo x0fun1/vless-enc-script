@@ -1,6 +1,7 @@
 """Real Xray-core v26.11.9 client -> independent Rust server, localhost only."""
 import argparse
 import ast
+import base64
 import concurrent.futures
 import contextlib
 import json
@@ -50,14 +51,20 @@ def wait_port(p, process):
 class Echo(socketserver.BaseRequestHandler):
     def handle(self):
         while True:
-            data = self.request.recv(65536)
+            try:
+                data = self.request.recv(65536)
+            except OSError:
+                return
             if not data:
                 # Delayed final data after upload EOF checks half-close handling.
                 time.sleep(0.15)
                 with contextlib.suppress(OSError):
                     self.request.sendall(b"HALF-CLOSE-OK")
                 return
-            self.request.sendall(data)
+            try:
+                self.request.sendall(data)
+            except OSError:
+                return
 
 class UdpEcho(socketserver.BaseRequestHandler):
     def handle(self):
@@ -154,9 +161,52 @@ def tls_case(socks, target, size=8193):
         secure.sendall(payload)
         assert exact(secure, size) == payload
 
+def untrusted_reality_target_ca_case(args, directory, client, server_config, environment, target_port):
+    certificate_directory = ROOT / ".build/interop/vision-certificate"
+    ca_key, ca_cert = certificate_directory / "untrusted-ca-key.pem", certificate_directory / "untrusted-ca-cert.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(ca_key), "-out", str(ca_cert), "-days", "1", "-subj", "/CN=Untrusted test CA", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    der = ssl.PEM_cert_to_DER_cert(ca_cert.read_text())
+    bad_server = json.loads(json.dumps(server_config))
+    bad_node = port()
+    bad_server["listen"] = f"127.0.0.1:{bad_node}"
+    bad_server["reality"]["target_ca_certificates"] = [base64.urlsafe_b64encode(der).decode().rstrip("=")]
+    bad_server_config = directory / "server-untrusted-target-ca.json"
+    bad_server_config.write_text(json.dumps(bad_server))
+    bad_server_log = ROOT / ".build/interop/reality-untrusted-target-ca-server.log"
+    bad_client = json.loads(json.dumps(client))
+    bad_socks = port()
+    bad_client["inbounds"][0]["port"] = bad_socks
+    bad_client["outbounds"][0]["settings"]["port"] = bad_node
+    bad_client_config = directory / "client-untrusted-target-ca.json"
+    bad_client_config.write_text(json.dumps(bad_client))
+    bad_client_log = ROOT / ".build/interop/reality-untrusted-target-ca-client.log"
+    with process(args.rust, bad_server_config, bad_server_log) as server_process:
+        wait_port(bad_node, server_process)
+        with process(args.reference, bad_client_config, bad_client_log, environment) as client_process:
+            wait_port(bad_socks, client_process)
+            request_succeeded = False
+            try:
+                with socks_connect(bad_socks, target_port) as stream:
+                    stream.sendall(b"target certificate trust bypass")
+                    stream.settimeout(2)
+                    request_succeeded = stream.recv(64) == b"target certificate trust bypass"
+            except (AssertionError, EOFError, OSError, TimeoutError):
+                pass
+    server_output = bad_server_log.read_text(errors="replace")
+    assert "UnknownIssuer" in server_output or "invalid peer certificate" in server_output, server_output
+    assert not request_succeeded, "REALITY target probe accepted an untrusted certificate and opened proxy traffic"
+
 def create_tls_certificate(directory):
-    key, cert = directory / "tls-key.pem", directory / "tls-cert.pem"
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", "/CN=localhost"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ca_key, ca_cert = directory / "test-ca-key.pem", directory / "test-ca-cert.pem"
+    key, csr, cert = directory / "tls-key.pem", directory / "tls-request.pem", directory / "tls-cert.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(ca_key), "-out", str(ca_cert), "-days", "2", "-subj", "/CN=VLESS interoperability test CA", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(csr), "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,DNS:example.com"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca_cert), "-CAkey", str(ca_key), "-CAcreateserial", "-out", str(cert), "-days", "1", "-copy_extensions", "copy"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
     return context
@@ -247,7 +297,12 @@ def main():
                     if args.mldsa65:
                         reality_args.append("--mldsa65")
                     reality_link = subprocess.check_output(reality_args, text=True, creationflags=CREATE_FLAGS).strip()
-                    config["reality"] = json.loads((d / "reality.json").read_text())["reality"]
+                    reality_config = json.loads((d / "reality.json").read_text())
+                    if args.reality:
+                        pem = (certificate_directory / "test-ca-cert.pem").read_text()
+                        der = ssl.PEM_cert_to_DER_cert(pem)
+                        reality_config["reality"]["target_ca_certificates"] = [base64.urlsafe_b64encode(der).decode().rstrip("=")]
+                    config["reality"] = reality_config["reality"]
                 (d / "server.json").write_text(json.dumps(config))
                 user = {"id": uid, "encryption": keys["encryption"]}
                 if args.vision:
@@ -287,6 +342,8 @@ def main():
                             print(server_log.read_text(errors="replace"))
                             print(client_log.read_text(errors="replace"))
                             raise
+                    if args.quick and args.reality and not args.vision and not args.mldsa65:
+                        untrusted_reality_target_ca_case(args, d, client, config, environment, tls_target)
                     if args.mldsa65:
                         bad_client = json.loads(json.dumps(client))
                         bad_socks = port()

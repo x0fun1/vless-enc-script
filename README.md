@@ -96,4 +96,4 @@ python3 tools/interop.py --rust target/release/vless-rust --reality --vision --m
 python3 tools/regression.py
 ```
 
-互通测试使用固定的 Xray-core v26.11.9。Windows localhost 和 Debian 13 / `www.nvidia.com` 的结果不代表其他公网目标兼容或完整 fingerprint parity。核心尚未经过独立安全审计；完整部署与验证范围见 [rust-core/README.md](rust-core/README.md) 和 [rust-core/VALIDATION.md](rust-core/VALIDATION.md)。远程一键安装入口在发布 `vless-rust-v0.3.0` 二进制和部署包后才会包含本次改动。
+互通测试使用固定的 Xray-core v26.11.9。Windows localhost 和 Debian 13 / `www.nvidia.com` 的结果不代表其他公网目标兼容或完整 fingerprint parity。核心尚未经过独立安全审计；验证记录见 [rust-core/VALIDATION.md](rust-core/VALIDATION.md)，审计缺口和报告流程见 [SECURITY.md](SECURITY.md)。远程一键安装入口在发布 `vless-rust-v0.3.1` 二进制和部署包后才会包含本次改动。

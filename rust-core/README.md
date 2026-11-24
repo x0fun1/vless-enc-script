@@ -1,8 +1,8 @@
 # 独立 VLESS Encryption Rust 核心
 
-版本 **0.3.0**。协议参照固定的 **Xray-core v26.11.9**，编译工具链固定为 **Rust 1.100.0**，依赖通过 `Cargo.lock` 锁定。进程自身完成加密握手、记录层和转发，不启动或嵌入 Go Xray。
+版本 **0.3.1**。协议参照固定的 **Xray-core v26.11.9**，编译工具链固定为 **Rust 1.100.0**，依赖通过 `Cargo.lock` 锁定。进程自身完成加密握手、记录层和转发，不启动或嵌入 Go Xray。
 
-当前功能均以 opt-in 方式启用；尚未经过独立安全审计。普通 Encryption 基线和后续实验功能的验证范围分别记录于 [VALIDATION.md](VALIDATION.md)。当前记录包含 Debian 13 上 v0.3.0 的 systemd 三节点及 NVIDIA target smoke；长时间运行、其他公网目标和完整 fingerprint parity 尚未验证。
+当前功能均以 opt-in 方式启用；尚未经过独立安全审计。普通 Encryption 基线和后续实验功能的验证范围分别记录于 [VALIDATION.md](VALIDATION.md)。当前记录包含 Debian 13 上 v0.3.1 候选的 systemd 三节点及 NVIDIA target smoke；该次临时节点已删除并恢复原 0.2.0 安装。长时间运行、移动网络、其他公网目标和完整 fingerprint parity 尚未验证；off-host 入站测试未做。
 
 ## 已支持的范围
 
@@ -69,7 +69,7 @@ cargo build --release --locked
 
 省略此字段是普通 Encryption 节点。时间窗口必须为 `1..3600` 秒；服务器应保持时间同步。认证失败、SNI / short ID 不匹配、过期或重放的 ClientHello 不会进入 VLESS 转发，而是把原始连接转发到配置的目标站。此转发受握手超时和连接 / 握手并发限制，因此不是无限期的通用目标站代理。
 
-REALITY authenticated path 目前对目标站有依赖：它会先连接配置的目标并捕获握手特征；认证失败连接则仍把原始字节转发到目标站。目标探测使用独立 TLS 连接观察目标是否回显 SNI / ALPN 信息，缓存最多 32 个 ALPN profile（10 分钟后重新探测）。目标证书在该独立探测握手中不做信任验证，探测结果只用于伪装 metadata，不提供目标身份验证；这一路径需要进一步安全审查。目标不可达或 TLS 形态不受支持时，握手会失败。REALITY 目标不能指向本监听地址；同端口的本地地址和通配监听下的 loopback 目标会被拒绝。
+REALITY authenticated path currently depends on the configured target: it connects there to capture handshake characteristics; unauthenticated connections still relay their original bytes to that target. The separate ALPN/SNI metadata probe validates the target's certificate chain and hostname using platform trust roots; up to 32 profiles are cached for ten minutes, keyed by the selected target address, SNI and ALPN offer. For a private or test target, `target_ca_certificates` may add up to 16 explicitly trusted DER certificates encoded as unpadded base64url. No application data is sent in the probe. Certificate verification on the independent metadata connection does not prove the target handles the capture and probe ClientHello identically. Unavailable or unsupported TLS targets cause the authenticated handshake to fail. The target resolver rejects any resolved address that would loop back to this listener.
 
 本机 Windows OpenSSL TLS echo target 实际协商 `X25519`；Debian 的 `www.nvidia.com` target 实际协商 `X25519MLKEM768`。两类 REALITY + Vision 均通过 Xray v26.11.9 客户端；NVIDIA 用例也观察到 SNI acknowledgement 和匹配的 ServerHello / 初始记录长度。其他目标、完整 TLS 流量形态和完整指纹等价仍未验证。
 
@@ -120,7 +120,7 @@ journalctl -u vless-rust@node-<ID> -f --no-pager
 systemctl restart vless-rust@node-<ID>
 ```
 
-不能与其他服务在相同监听地址和端口同时运行。安装不负责停止原 Xray；更新正在运行的节点会短暂中断已有连接。必须发布 `vless-rust-v0.3.0` 下的二进制、部署包及其 SHA-256 文件后，远程一键入口才能取得本版本。
+不能与其他服务在相同监听地址和端口同时运行。安装不负责停止原 Xray；更新正在运行的节点会短暂中断已有连接。必须发布 `vless-rust-v0.3.1` 下的二进制、部署包及其 SHA-256 文件后，远程一键入口才能取得本版本。
 
 ## 从现有普通节点迁移
 
