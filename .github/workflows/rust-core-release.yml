@@ -3,6 +3,13 @@ name: Build Rust core release
 on:
   push:
     branches: [main]
+    tags: ["vless-rust-v*"]
+    paths:
+      - "rust-core/**"
+      - "tests/**"
+      - "install.sh"
+      - ".github/workflows/rust-core-release.yml"
+  pull_request:
     paths:
       - "rust-core/**"
       - "tests/**"
@@ -11,7 +18,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -26,12 +37,19 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: 1.100.0
+          components: rustfmt, clippy
+          cache-workspaces: rust-core -> target
       - name: Rust tests
         working-directory: rust-core
         run: cargo test --locked
+      - name: Rust formatting
+        working-directory: rust-core
+        run: cargo fmt -- --check
       - name: Rust clippy
         working-directory: rust-core
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -51,6 +69,13 @@ jobs:
       - name: Build release binary
         working-directory: rust-core
         run: cargo build --locked --release
+      - name: Configuration and REALITY policy regressions
+        run: >-
+          python3 rust-core/tools/regression.py
+          Regression.test_configure_preserves_service_group_read_access
+          Regression.test_oversized_configuration_and_import_are_rejected
+          Regression.test_reality_fallback_cannot_connect_to_private_target_by_default
+          Regression.test_reality_unauthenticated_bytes_are_relayed_to_target
       - name: Package binary and checksum
         shell: bash
         run: |
@@ -65,11 +90,15 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/vless-rust-v')
     needs: build
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           sparse-checkout: |
             rust-core/Cargo.toml
             rust-core/venc
@@ -86,6 +115,10 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' rust-core/Cargo.toml | head -n 1)
           test -n "$version"
+          if [[ "$GITHUB_REF_NAME" != "vless-rust-v$version" ]]; then
+            echo "::error::Release tag must match the Rust package version."
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Package management command
         run: |
@@ -93,11 +126,18 @@ jobs:
           sha256sum dist/venc | awk '{print $1}' > dist/venc.sha256
           tar -czf dist/vless-rust-deploy.tar.gz -C rust-core install.sh venc systemd/vless-rust.service 'systemd/vless-rust@.service'
           sha256sum dist/vless-rust-deploy.tar.gz | awk '{print $1}' > dist/vless-rust-deploy.tar.gz.sha256
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: vless-rust-v${{ steps.package.outputs.version }}
-          name: vless-rust ${{ steps.package.outputs.version }}
-          prerelease: false
-          make_latest: false
-          overwrite_files: true
-          files: dist/*
+      # gh creates a new release and rejects an existing release for this tag.
+      # Assets upload to a draft before publication; published versions stay fixed.
+      - name: Publish a new versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "vless-rust $PACKAGE_VERSION" \
+            --notes "Source commit: $GITHUB_SHA" \
+            --latest=false

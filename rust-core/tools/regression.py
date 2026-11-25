@@ -76,6 +76,32 @@ class Regression(unittest.TestCase):
                     self.assertIn("@[2001:db8::1]:18443?", link)
                     self.assertEqual(before, path.read_bytes())
 
+    @unittest.skipIf(os.name == "nt", "Unix configuration ownership and permissions")
+    def test_configure_preserves_service_group_read_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "config.json"
+            value = self.config(18443)
+            path.write_text(json.dumps(value))
+            # A supplementary group exercises replacement-file chown on CI
+            # without requiring root; root may use any different numeric GID.
+            alternate_gid = next((gid for gid in os.getgroups() if gid != path.stat().st_gid), None)
+            if alternate_gid is None and os.geteuid() == 0:
+                alternate_gid = 1 if path.stat().st_gid != 1 else 0
+            if alternate_gid is not None:
+                os.chown(path, -1, alternate_gid)
+            for mode in (0o600, 0o640, 0o644, 0o666):
+                with self.subTest(mode=oct(mode)):
+                    path.chmod(mode)
+                    before = path.stat()
+                    subprocess.check_call(
+                        [str(RUST), "configure", "--config", path.name, "--host", "example.com"],
+                        cwd=directory, stdout=subprocess.DEVNULL, creationflags=CREATE_FLAGS,
+                    )
+                    after = path.stat()
+                    self.assertEqual((after.st_uid, after.st_gid), (before.st_uid, before.st_gid))
+                    self.assertEqual(after.st_mode & 0o777, mode & 0o640)
+                    self.assertEqual(json.loads(path.read_text())["decryption"], value["decryption"])
+
     def test_init_accepts_requested_uuid_and_link_roundtrips(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "config.json"
@@ -110,6 +136,9 @@ class Regression(unittest.TestCase):
             d = pathlib.Path(directory)
             node = port()
             subprocess.check_call([str(RUST), "init", "--config", str(d / "server.json"), "--host", "127.0.0.1", "--listen-host", "127.0.0.1", "--port", str(node), "--reality", "--server-name", "example.com", "--target", f"127.0.0.1:{target}"], stdout=subprocess.DEVNULL, creationflags=CREATE_FLAGS)
+            config = json.loads((d / "server.json").read_text())
+            config["limits"]["allow_private_destinations"] = True
+            (d / "server.json").write_text(json.dumps(config))
             with process(RUST, d / "server.json", d / "server.log") as server:
                 wait_port(node, server)
                 for payload in (b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", b"\x16\x03\x03\x00\x05\x01\x00\x00\x01\x00"):
@@ -120,6 +149,46 @@ class Regression(unittest.TestCase):
                         self.assertEqual(exact(s, len(payload)), payload)
                         s.sendall(b"follow-up")
                         self.assertEqual(exact(s, 9), b"follow-up")
+
+    def test_reality_fallback_cannot_connect_to_private_target_by_default(self):
+        with socket.socket() as target, tempfile.TemporaryDirectory() as directory:
+            target.bind(("127.0.0.1", 0))
+            target.listen()
+            target.settimeout(0.3)
+            d = pathlib.Path(directory)
+            node = port()
+            subprocess.check_call(
+                [str(RUST), "init", "--config", str(d / "server.json"),
+                 "--host", "127.0.0.1", "--listen-host", "127.0.0.1",
+                 "--port", str(node), "--reality", "--server-name", "example.com",
+                 "--target", f"127.0.0.1:{target.getsockname()[1]}"],
+                stdout=subprocess.DEVNULL, creationflags=CREATE_FLAGS,
+            )
+            with process(RUST, d / "server.json", d / "server.log") as server:
+                wait_port(node, server)
+                with socket.create_connection(("127.0.0.1", node), timeout=3) as client:
+                    client.settimeout(3)
+                    client.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                    with contextlib.suppress(ConnectionResetError):
+                        self.assertEqual(client.recv(1), b"")
+                with self.assertRaises(socket.timeout):
+                    target.accept()
+            self.assertIn("REALITY target resolved to a private or special-use address",
+                          (d / "server.log").read_text())
+
+    def test_oversized_configuration_and_import_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            d = pathlib.Path(directory)
+            source = d / "oversized.json"
+            source.write_bytes(b" " * (1024 * 1024 + 1))
+            for args in (["check", "--config", str(source)],
+                         ["import-xray", "--input", str(source), "--output", str(d / "rust.json")]):
+                with self.subTest(command=args[0]):
+                    result = subprocess.run([str(RUST), *args], capture_output=True, text=True,
+                                            creationflags=CREATE_FLAGS)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("configuration exceeds 1 MiB", result.stderr)
+            self.assertFalse((d / "rust.json").exists())
 
     def test_reality_mldsa65_is_opt_in_and_reconfiguration_preserves_reality_keys(self):
         with tempfile.TemporaryDirectory() as directory:

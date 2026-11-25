@@ -4,6 +4,7 @@ import ast
 import base64
 import concurrent.futures
 import contextlib
+import hashlib
 import json
 import os
 import pathlib
@@ -243,7 +244,7 @@ def udp_case(socks, target, ipv6=False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rust", type=pathlib.Path, default=ROOT / "rust-core/target/debug" / ("vless-rust.exe" if os.name == "nt" else "vless-rust"))
+    parser.add_argument("--rust", type=pathlib.Path, default=ROOT / "rust-core/target/release" / ("vless-rust.exe" if os.name == "nt" else "vless-rust"))
     parser.add_argument("--reference", type=pathlib.Path, default=ROOT / ".build/reference" / ("xray.exe" if os.name == "nt" else "xray"))
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--relays-only", action="store_true")
@@ -253,10 +254,14 @@ def main():
     parser.add_argument("--fingerprint", default="chrome", choices=("chrome", "firefox", "safari"), help="REALITY client TLS fingerprint")
     parser.add_argument("--appearance", choices=("native", "xorpub", "random"), help="filter quick cases to an Encryption appearance")
     args = parser.parse_args()
+    args.rust = args.rust.resolve()
     if args.mldsa65 and not args.reality:
         parser.error("--mldsa65 requires --reality")
     version = subprocess.check_output([str(args.reference), "version"], text=True, creationflags=CREATE_FLAGS)
     assert version.startswith("Xray 26.11.9 "), version
+    rust_version = subprocess.check_output([str(args.rust), "version"], text=True, creationflags=CREATE_FLAGS).strip()
+    rust_sha256 = hashlib.sha256(args.rust.read_bytes()).hexdigest()
+    print(f"Rust binary: {args.rust} ({rust_version}; sha256={rust_sha256})", flush=True)
     output = ROOT / ".build/interop"
     output.mkdir(parents=True, exist_ok=True)
     report = []
@@ -412,7 +417,18 @@ def main():
                     assert "handshake=0rtt" in log, "0-RTT resumption was not exercised"
                 report.append({"case": label, "result": "passed", "cipher_verified": expected, "resumption_verified": mux is False or mux == -1, "target_server_hello_verified": args.reality, "target_record_lengths_verified": args.reality and not args.mldsa65, "vision_direct_uplink_transitions": vision_counts[0] if args.vision else None, "vision_direct_downlink_transitions": vision_counts[1] if args.vision else None})
                 print(f"PASS {label}", flush=True)
-    (output / ("reality-" + args.fingerprint + "-results.json" if args.reality else "relay-results.json" if args.relays_only else "results.json")).write_text(json.dumps(report, indent=2) + "\n")
+    suite = "-".join(part for part in (
+        "vision" if args.vision else "", "mldsa65" if args.mldsa65 else "",
+        "reality-" + args.fingerprint if args.reality else "relay" if args.relays_only else "plain",
+        "quick" if args.quick else "", args.appearance or "",
+    ) if part)
+    (output / f"{suite}-results.json").write_text(json.dumps(report, indent=2) + "\n")
+    metadata = {"rust_binary": str(args.rust), "rust_version": rust_version,
+                "rust_sha256": rust_sha256, "reference_version": version.splitlines()[0],
+                "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "arguments": {key: str(value) if isinstance(value, pathlib.Path) else value
+                              for key, value in vars(args).items()}, "passed_cases": len(report)}
+    (output / f"{suite}-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"{len(report)} official client variants passed")
 
 if __name__ == "__main__":

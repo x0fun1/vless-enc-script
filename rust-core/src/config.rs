@@ -1,9 +1,28 @@
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, net::SocketAddr, path::Path};
+use std::{collections::HashSet, fs, io::Read, net::SocketAddr, path::Path};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+fn read_limited(reader: impl Read) -> Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    reader
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read configuration")?;
+    ensure!(
+        bytes.len() as u64 <= MAX_CONFIG_BYTES,
+        "configuration exceeds 1 MiB"
+    );
+    Ok(bytes)
+}
+
+pub fn read_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    read_limited(fs::File::open(path).context("open configuration")?)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appearance {
@@ -117,8 +136,7 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = Zeroizing::new(fs::read(path).context("read configuration")?);
-        ensure!(bytes.len() <= 1024 * 1024, "configuration exceeds 1 MiB");
+        let bytes = read_file(path)?;
         let config: Self = serde_json::from_slice(&bytes)
             .context("parse configuration (use the Rust configuration schema)")?;
         config.validate()?;
@@ -174,5 +192,17 @@ impl Config {
             reality.validate()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_read_stops_at_limit_even_for_unbounded_input() {
+        assert!(read_limited(std::io::repeat(b' ')).is_err());
+        let bytes = vec![b' '; MAX_CONFIG_BYTES as usize];
+        assert_eq!(read_limited(bytes.as_slice()).unwrap().len(), bytes.len());
     }
 }

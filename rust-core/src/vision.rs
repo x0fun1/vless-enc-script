@@ -225,6 +225,19 @@ impl Decoder {
         self.direct
     }
 
+    pub fn finish(&self) -> Result<()> {
+        let at_frame_boundary = self.started
+            && self.pending.is_empty()
+            && self.direction.remaining_command == 5
+            && self.direction.remaining_content == 0
+            && self.direction.remaining_padding == 0;
+        ensure!(
+            self.finished || (!self.started && self.pending.is_empty()) || at_frame_boundary,
+            "unexpected EOF in XTLS Vision frame"
+        );
+        Ok(())
+    }
+
     pub fn decode(&mut self, input: &[u8]) -> Result<Decoded> {
         if self.direct || self.finished {
             return Ok(Decoded {
@@ -235,13 +248,14 @@ impl Decoder {
         let mut output = Vec::new();
         let mut pos = 0;
         if !self.started {
-            if self.pending.len() < 21 {
-                return Ok(Decoded { bytes: output });
-            }
-            if self.pending[..16] != self.uuid {
+            let prefix_length = self.pending.len().min(self.uuid.len());
+            if self.pending[..prefix_length] != self.uuid[..prefix_length] {
                 self.finished = true;
                 output.extend_from_slice(&self.pending);
                 self.pending.clear();
+                return Ok(Decoded { bytes: output });
+            }
+            if self.pending.len() < 21 {
                 return Ok(Decoded { bytes: output });
             }
             self.started = true;
@@ -460,6 +474,47 @@ pub fn is_complete_record(input: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_eof_rejects_every_truncated_frame_component() {
+        let uuid = [0x42; 16];
+        let mut frame = uuid.to_vec();
+        frame.extend_from_slice(&[COMMAND_END, 0, 2, 0, 3, 0xaa, 0xbb, 0, 0, 0]);
+        for length in 1..frame.len() {
+            let mut decoder = Decoder::new(uuid, SharedState::new(), true);
+            for chunk in frame[..length].chunks(3) {
+                decoder.decode(chunk).unwrap();
+            }
+            assert!(decoder.finish().is_err(), "accepted {length}-byte prefix");
+        }
+        let mut decoder = Decoder::new(uuid, SharedState::new(), true);
+        assert_eq!(decoder.decode(&frame).unwrap().bytes, [0xaa, 0xbb]);
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn vision_eof_accepts_empty_stream_and_complete_continue_frame_only() {
+        let uuid = [0x42; 16];
+        let mut decoder = Decoder::new(uuid, SharedState::new(), true);
+        decoder.finish().unwrap();
+        let mut frame = uuid.to_vec();
+        frame.extend_from_slice(&[COMMAND_CONTINUE, 0, 1, 0, 0, 0xaa]);
+        decoder.decode(&frame).unwrap();
+        decoder.finish().unwrap();
+        for length in 1..5 {
+            let mut decoder = Decoder::new(uuid, SharedState::new(), true);
+            decoder.decode(&frame).unwrap();
+            decoder.decode(&[0; 5][..length]).unwrap();
+            assert!(decoder.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn short_non_vision_payload_is_forwarded_without_waiting_for_header() {
+        let mut decoder = Decoder::new([0x42; 16], SharedState::new(), false);
+        assert_eq!(decoder.decode(b"ok").unwrap().bytes, b"ok");
+        decoder.finish().unwrap();
+    }
 
     #[test]
     fn vision_addon_frames_roundtrip_across_arbitrary_boundaries() {

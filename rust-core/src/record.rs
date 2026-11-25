@@ -132,6 +132,9 @@ impl Reader {
                 }
                 self.direct_body_remaining -= n;
                 written += n;
+                // A short complete TLS record must reach the destination
+                // without waiting for another record to fill the caller buffer.
+                return Ok(written);
             }
         }
         Ok(written)
@@ -154,6 +157,9 @@ impl Reader {
             let mut header = [0; 5];
             let n = self.socket.read(&mut header[..1]).await?;
             if n == 0 {
+                if let Some(vision) = &self.vision {
+                    vision.finish()?;
+                }
                 return Ok(0);
             }
             self.socket.read_exact(&mut header[1..]).await?;
@@ -328,6 +334,10 @@ impl Writer {
 
     pub async fn shutdown(&mut self) -> Result<()> {
         self.socket.shutdown().await?;
+        ensure!(
+            self.direct_header_len == 0 && self.direct_body_remaining == 0,
+            "unexpected EOF in outgoing direct TLS record"
+        );
         Ok(())
     }
 }
@@ -524,6 +534,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vision_direct_small_records_do_not_wait_for_the_next_record() {
+        let (mut client_reader, mut client_writer, mut server_reader, mut server_writer, _, _) =
+            vision_direct_pair().await;
+        let mut record = vec![23, 3, 3, 0, 17];
+        record.extend([0xcc; 17]);
+        client_writer.write_all(&record).await.unwrap();
+        let mut received = [0; 1024];
+        timeout(Duration::from_secs(1), async {
+            let mut n = 0;
+            while n < record.len() {
+                let read = server_reader.read_some(&mut received[n..]).await.unwrap();
+                assert_ne!(read, 0);
+                n += read;
+            }
+            assert_eq!(&received[..n], record);
+        })
+        .await
+        .expect("uplink waited for another record");
+
+        server_writer.write_all(&record).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            let mut n = 0;
+            while n < record.len() {
+                let read = client_reader.read_some(&mut received[n..]).await.unwrap();
+                assert_ne!(read, 0);
+                n += read;
+            }
+            assert_eq!(&received[..n], record);
+        })
+        .await
+        .expect("downlink waited for another record");
+    }
+
+    #[tokio::test]
     async fn vision_direct_clean_half_close_is_eof_only_at_record_boundary() {
         let (mut client_reader, mut client_writer, mut server_reader, mut server_writer, _, _) =
             vision_direct_pair().await;
@@ -541,8 +585,8 @@ mod tests {
         let truncated = [23, 3, 3, 0, 17, 1, 2, 3];
         client_writer.write_all(&truncated).await.unwrap();
         server_writer.write_all(&truncated).await.unwrap();
-        client_writer.shutdown().await.unwrap();
-        server_writer.shutdown().await.unwrap();
+        assert!(client_writer.shutdown().await.is_err());
+        assert!(server_writer.shutdown().await.is_err());
 
         let mut uplink = [0; 22];
         let mut downlink = [0; 22];
@@ -565,11 +609,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vision_direct_writer_reports_a_buffered_truncated_header() {
+        let (_, mut client_writer, _, _, _, _) = vision_direct_pair().await;
+        client_writer.write_all(&[23, 3]).await.unwrap();
+        assert!(
+            client_writer
+                .shutdown()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected EOF in outgoing direct TLS record")
+        );
+    }
+
+    #[tokio::test]
     async fn vision_direct_truncated_header_is_not_clean_eof() {
         let (_, mut client_writer, mut server_reader, _, _, _) = vision_direct_pair().await;
         client_writer.socket.write_all(&[23, 3]).await.unwrap();
         client_writer.shutdown().await.unwrap();
         assert!(server_reader.read_some(&mut [0; 1]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypted_vision_frames_reject_truncated_eof() {
+        let uuid = [0x42; 16];
+        let mut frame = uuid.to_vec();
+        frame.extend_from_slice(&[1, 0, 2, 0, 3, 0xaa, 0xbb, 0, 0, 0]);
+        for length in [1, 15, 16, 20, 21, 22, 23, 25, 26] {
+            let (_, mut client, mut server, _) = pair(Algorithm::Aes).await;
+            server.enable_vision(uuid, SharedState::new()).unwrap();
+            client.write_all(&frame[..length]).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut output = [0; 8];
+            let eof = loop {
+                match server.read_some(&mut output).await {
+                    Ok(0) => break Ok(()),
+                    Ok(_) => {}
+                    Err(error) => break Err(error),
+                }
+            };
+            if length == frame.len() {
+                eof.unwrap();
+            } else {
+                assert!(
+                    eof.unwrap_err()
+                        .to_string()
+                        .contains("unexpected EOF in XTLS Vision frame"),
+                    "accepted {length}-byte prefix"
+                );
+            }
+        }
     }
 
     #[tokio::test]
