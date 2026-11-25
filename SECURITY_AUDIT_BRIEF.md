@@ -5,11 +5,12 @@
 ## Exact review target
 
 - Published baseline: `vless-rust-v0.3.1`, source commit `139f908ab1536bbf10ca8a10f658133cbfe0049b`.
-- Current un-released candidate: `854802705e1be47edb096e5187d81e1d69d766ec` on local branch `security/vision-fragment-eof`. It includes the direct-truncation/fragmented-ServerHello patch `fc534857ed817982aa5b56db5786e40f1f5e2ecf` and follow-up ClientHello filter-budget fix `854802705e1be47edb096e5187d81e1d69d766ec`, based on published main HEAD `b466bf7e51fbf9045826ebbad41972e15bffd14d`.
-- The candidate is **not pushed or released**. Rust package version metadata still says 0.3.1, so the candidate must not be mistaken for the released 0.3.1 binary.
+- Release provenance baseline: `b466bf7e51fbf9045826ebbad41972e15bffd14d`.
+- Current unreleased implementation candidate: `87c9381e3409164bb48a0515b78e74694ce896d8` on `security/vision-fragment-eof`, as recorded in [the 2026-11-25 maintainer review](docs/SECURITY_REVIEW_2026-11-25.md). Earlier Vision patches `fc534857ed817982aa5b56db5786e40f1f5e2ecf` and `854802705e1be47edb096e5187d81e1d69d766ec` are included but are not the latest complete candidate. Subsequent documentation commits record its scope; use the frozen implementation commit when reproducing the build.
+- The candidate is **not released**. Rust package version metadata still says 0.3.1, so the candidate must not be mistaken for the released 0.3.1 binary.
 - Interoperability reference is pinned Xray-core v26.11.9, source `676eaf66f8f05d4d558ee7a74b4736623d3feeb9`.
 
-The reviewer should obtain the repository at the exact candidate commit and state whether the review covers the full tree or only the delta. For a release decision, review the full tree, including the vendored rustls modifications, and not only the two files in the latest patch.
+The reviewer should obtain the repository at the frozen candidate commit and state whether the review covers the full tree or only the delta. For a release decision, review the full tree, including the vendored rustls modifications, configuration replacement, installers, and release workflow. A working-tree description is not a substitute for a reproducible audit snapshot.
 
 ## Requested scope
 
@@ -26,12 +27,15 @@ The reviewer should obtain the repository at the exact candidate commit and stat
    - Allocation and CPU bounds under malformed or deliberately slow client/target traffic.
 4. **Vision state and direct forwarding**
    - Addons/Continue/End/Direct state transitions in both directions, random-appearance TLS record-header masking, partial reads/writes, half-close, clean EOF, truncated record/body/header behavior and Mux interactions.
-   - The candidate adds truncated direct-record EOF errors, fragmented ClientHello/ServerHello sniffing, and deterministic synthetic bidirectional Direct tests; these changes need independent review as well as retest.
+   - The candidate adds truncated Vision-frame errors and masked random-appearance Direct-record EOF errors, fragmented ClientHello/ServerHello sniffing, timely delivery of short masked Direct records, and deterministic synthetic bidirectional Direct tests; these changes need independent review as well as retest. Native/xorpub Direct passes data through, with TLS integrity checked by the endpoints.
 5. **Target and network boundaries**
    - DNS resolution/rebinding assumptions, listener self-target checks, private-destination filtering, custom target CA trust, certificate/SNI validation of the separate metadata probe, fallback relay behavior, timeouts and cache keys/expiry.
    - Confirm that the capture connection and metadata-probe connection cannot be redirected to unsafe or unexpected endpoints.
+   - Recheck the default private-target policy for every DNS answer, explicit private-network opt-in, and self-listener protection. An unauthenticated fallback client cannot choose a different configured target; assess the actual configuration/DNS preconditions. Certificate verification on the separate metadata probe does not establish that the capture connection used the same target behavior.
+   - Verify custom target CA parsing and native/custom trust-store merging, including empty platform stores, malformed custom certificates and continued chain/SNI validation.
 6. **Deployment and release boundary**
    - `install.sh`, `rust-core/install.sh`, `rust-core/venc`, systemd units/users/permissions, migration/rollback, release workflow and checksum/provenance handling.
+   - Check bounded file reads, exclusive temporary-file creation, cleanup ownership, atomic replacement and Unix service ownership/group access. Confirm that releases require a matching version tag and do not overwrite an already-published version. Downloaded SHA-256 sidecars are not an independent signature or trust root.
 
 ## Threat model and exclusions to state in the report
 
@@ -41,9 +45,9 @@ The project has **not** established complete TLS fingerprint parity, arbitrary-t
 
 ## Available maintainer evidence (not independent assurance)
 
-For the v0.3.1 release, `rust-core/VALIDATION.md` records Windows and Debian 13 tests, official Xray-core v26.11.9 interoperability, dependency scans and a systemd smoke. The current candidate has Windows results: 34 Rust tests, strict Clippy, locked release build, 14 core regressions, 16 deployment regressions, 30 REALITY+Vision Xray variants, 30 plain Vision Xray variants, and native/random ML-DSA-65 subsets. Chrome/Firefox/Safari REALITY quick cases passed. New deterministic tests exercise both synthetic Direct directions, fragmented ClientHello/ServerHello boundaries, masked fragmented Direct record headers, clean EOF and truncated headers/bodies.
+For the v0.3.1 release, `rust-core/VALIDATION.md` records historical Windows and Debian 13 tests, official Xray-core v26.11.9 interoperability, dependency scans and a systemd smoke. For the 2026-11-25 candidate, use the separate dated section and [maintainer review](docs/SECURITY_REVIEW_2026-11-25.md): they identify the actual tested binary and current results. Do not reuse an earlier debug binary or historical matrix as evidence for this working tree.
 
-**The candidate has not been re-run on Debian or systemd**, and GitHub CI has not run for this local branch. No dependency lockfile changed in this candidate. The previous `cargo-audit` v0.23.0 scans of both lockfiles are dependency-advisory scans only; they do not cover project code or protocol design.
+**The current candidate has not been re-run on Debian or systemd**, and GitHub CI has not run for this local branch. Ring/std is the executed provider; AWS-LC paths have source review only. Windows skips Unix ownership/permission verification; a dedicated Linux CI regression has been added but is not yet a passing result. No dependency lockfile changed. The 2026-11-25 cargo-audit 0.23.0 scans of both lockfiles report no known advisories with RustSec snapshot `b9b8a3c2cb1f2a3c76ab17a551193568c9f8b7a4`; yanked-crate checks were disabled. These scans do not cover project code, protocol design, or the custom rustls patch.
 
 ## Requested deliverables
 

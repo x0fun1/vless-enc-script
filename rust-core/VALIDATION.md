@@ -1,10 +1,12 @@
 # 验证记录
 
-日期：2026 年 11 月 22 日。环境：Windows-11-10.0.26300-SP0，Rust 1.100.0，官方 Xray-core v26.11.9（Go 1.27.3，windows/amd64）。
+本文保留各轮验证的日期与源码范围。2026-11-25 未发布安全候选的结果见文末；历史发布结果不代表当前工作树已经在相同环境复测。
+
+以下基线日期：2026 年 11 月 22 日。环境：Windows-11-10.0.26300-SP0，Rust 1.100.0，官方 Xray-core v26.11.9（Go 1.27.3，windows/amd64）。
 
 ## 功能验证
 
-最终 release 二进制已通过：
+2026-11-22 当时的 release 二进制已通过：
 
 - 30 组官方客户端互通：两种认证 × 三种外观 × 两种密码算法 × Mux 开关，以及 6 组完全关闭 Mux 的普通 UDP 用例。
 - 6 组八层混合认证中继互通：三种外观 × 两种密码算法。
@@ -43,13 +45,13 @@ python3 rust-core/tools/benchmark.py
 
 ## 基线验证边界
 
-2026-11-22 的 Windows 基线记录不覆盖 Linux/systemd 部署和本次 Vision/REALITY 改动。当前 Debian 验证结果见下文；尚未验证长时间运行、移动网络、NAT 空闲断开或其他公网目标。没有原服务器的断流日志，不能确认原现场故障的具体原因。
+2026-11-22 的 Windows 基线记录不覆盖 Linux/systemd 部署和后续 Vision/REALITY 改动。2026-11-24 的 Debian 验证结果见下文；尚未验证长时间运行、移动网络、NAT 空闲断开或其他公网目标。没有原服务器的断流日志，不能确认原现场故障的具体原因。
 
 ## 后续实验功能：Vision + REALITY（Windows localhost）
 
 截至 2026-11-24，后续工作树以官方 Xray-core v26.11.9 验证 Vision + REALITY 组合。上游 VLESS Vision outbound 可在 REALITY transport 上运行；本实现曾错误地在配置校验中拒绝组合，现已移除该限制。测试目标均为 Windows localhost TLS echo / echo 服务，不代表公网或 Debian 生产环境。
 
-- 最新 Rust 本地检查：vless-rust **0.3.1**，29 项 Rust tests、strict Clippy、`cargo build --release --locked` 均通过。Windows 的完整互通矩阵针对最终源代码重新运行通过。
+- 2026-11-24 当时的 Rust 本地检查：vless-rust **0.3.1**，29 项 Rust tests、strict Clippy、`cargo build --release --locked` 均通过。Windows 的完整互通矩阵针对该轮最终源代码重新运行通过。
 - 全量普通 Encryption 互通 `python tools/interop.py`：30 个官方 Xray 客户端变体通过；八层混合认证 relay-only 另 6 个通过。
 - `python tools/interop.py --quick --reality` 现验证 metadata probe 的平台证书信任和 SNI：测试 CA 签发的 localhost target 正向成功；替换为不相关但有效的 CA 时，服务端报告 `UnknownIssuer`，且代理流未建立。
 - `python tools/interop.py --reality --vision`：30 个官方 Xray 变体全通过，覆盖 X25519 / ML-KEM-768、native / xorpub / random、AES / ChaCha、Mux 开 / 关及无 Mux XUDP 用例。random 外观在 Vision Direct 后继续对 TLS record header 使用 Xray 对应的 CTR mask；完整矩阵通过了 TLS echo 与 TCP/UDP 流量。
@@ -57,7 +59,7 @@ python3 rust-core/tools/benchmark.py
 - 另用 `--quick --reality --vision --mldsa65 --appearance random` 验证 ML-DSA-65 + random 外观的 4 个 auth/Mux 变体。
 - Windows TLS echo target 实际协商 `X25519`；Debian 的实际 `www.nvidia.com` target 协商 `X25519MLKEM768`，REALITY + Vision systemd client request 通过。其他公网目标 / TLS group 仍未验证。
 - `vision_direct_*` 诊断在 Mux 关闭的 TLS echo 用例观察到 downlink Direct 转换；uplink Direct 计数为 0。Mux 开启用例的功能 echo 成功，但未发生 Direct 转换。不能宣称双向 Direct 完整实现。
-- 最新 CLI/menu 回归：`rust-core/tools/regression.py` 14 项、`tests/regression.py` 16 项通过（Windows）。验证包含三类 menu、随机默认 SpiderX、NVIDIA SNI/target 默认、ML-DSA 默认为关闭 / 可选启用和 credentials reconfigure。
+- 该轮 CLI/menu 回归：`rust-core/tools/regression.py` 14 项、`tests/regression.py` 16 项通过（Windows）。验证包含三类 menu、随机默认 SpiderX、NVIDIA SNI/target 默认、ML-DSA 默认为关闭 / 可选启用和 credentials reconfigure。
 
 
 REALITY 指纹捕获仍仅涵盖完整 ServerHello 位于单个 TLS record、兼容 CCS、当前支持的 TLS 1.3 suite/group 和有限初始记录形态；不匹配 PSK/resumption、post-handshake、完整时序或 ML-DSA-65 大证书导致的记录长度变化。短 / 超长 TLS record 和解析所得地址 self-target 检查已有单元测试。
@@ -71,19 +73,62 @@ REALITY 指纹捕获仍仅涵盖完整 ServerHello 位于单个 TLS record、兼
 - 官方 Xray v26.11.9：普通 Encryption 30 项、8 层 relay 6 项、REALITY + Vision 全量 30 项通过。REALITY + Vision + ML-DSA-65 的 native / random quick matrix 共 8 项通过，正确公钥验证成功、错误公钥返回 `BadCertificate`。独立 REALITY Chrome / Firefox / Safari 快速用例均通过；不受信任自定义 target CA 用例返回 `UnknownIssuer` 且无代理流量。
 - 上一轮 v0.3.0 安装基线中，真实菜单创建过三类 systemd 节点；官方 Xray 经各服务访问真实 `www.nvidia.com` 均完成 HTTPS（HTTP 307），ML-DSA 客户端日志记有 `uConn.Verified: true`。该轮目标日志还观察到 `sni_ack=true`、`server_hello_match=true` 和匹配的初始记录长度。Xray 未发送 TLS `close_notify`，rustls 因而记录 `UnexpectedEof`；成功的 HTTP 不代表 TLS 正常关闭。
 - v0.3.1 在 Debian systemd 上由真实菜单创建了普通 Encryption、X25519 REALITY + Vision、ML-KEM-768 REALITY + Vision + ML-DSA-65 三节点；本机官方 Xray 分别访问 NVIDIA 目标取得 HTTP 307。重新安装 v0.3.1 后配置哈希不变、服务保持 active；随后清除临时节点并恢复原 0.2.0 core / manager / unit。
-- 已发布 `vless-rust-v0.3.1`；源代码功能修复 commit 为 `139f908ab1536bbf10ca8a10f658133cbfe0049b`，最终文档/发布流水线 HEAD 为 `5e982412b8aa8b65c4bba703713dc4ba3a1aee01`，Actions run [45319316407](https://github.com/x0fun1/vless-enc-script/actions/runs/45319316407) 成功。GitHub Release 同时提供 x86_64 / aarch64 核心、`venc`、部署包及各自 SHA-256 sidecar；下载后逐一校验通过。SHA-256：x86_64 `9d615b518399b3fa112a9fc40491878d894a19fb4ab209742952f96df28ef40f`；aarch64 `8bab1f1d6d63285cfad949f889b1366cc592721e7711948eb1b6b4d2f723127a`；venc `ff7200ff9421b3482072180493301fffe0e6d23426642b62ed2274336cf641a2`；deployment bundle `a0612f8d58a3d5feb824b92818271b9fd18905b7ce5c4043fb83db29caaf1b89`。部署包归档条目检查通过。
+- 已发布 `vless-rust-v0.3.1`；源代码功能修复 commit 为 `139f908ab1536bbf10ca8a10f658133cbfe0049b`，发布来源文档基线为 `b466bf7e51fbf9045826ebbad41972e15bffd14d`，历史 Actions run [45319316407](https://github.com/x0fun1/vless-enc-script/actions/runs/45319316407) 成功。GitHub Release 同时提供 x86_64 / aarch64 核心、`venc`、部署包及各自 SHA-256 sidecar；该次下载后逐一校验通过。该次 SHA-256：x86_64 `9d615b518399b3fa112a9fc40491878d894a19fb4ab209742952f96df28ef40f`；aarch64 `8bab1f1d6d63285cfad949f889b1366cc592721e7711948eb1b6b4d2f723127a`；venc `ff7200ff9421b3482072180493301fffe0e6d23426642b62ed2274336cf641a2`；deployment bundle `a0612f8d58a3d5feb824b92818271b9fd18905b7ce5c4043fb83db29caaf1b89`。部署包归档条目检查通过。旧工作流允许后续 main push 覆盖同版本资产，因此这些哈希是当时的下载记录，不能据此推定以后同名资产的来源；本轮修复见文末。
 
-本次自动化安全依赖检查：cargo-audit v0.23.0 对应用锁文件（131 个依赖）及 vendored rustls 锁文件（134 个依赖）分别扫描，均无告警 / advisories。RustSec advisory database commit `52384ab5581a4487b62c549eef95cf7ba7e8bad5`（2026-11-23）；扫描未使用 ignore。主构建解析 rustls-webpki 0.103.17；vendor lock 中 rustls-webpki 0.103.17、webpki-roots 1.0.10。RUSTSEC-2024-0437 的 protobuf 不在这两个依赖图中。
+该轮自动化安全依赖检查：cargo-audit v0.23.0 对应用锁文件（131 个依赖）及 vendored rustls 锁文件（134 个依赖）分别扫描，均无告警 / advisories。RustSec advisory database commit `52384ab5581a4487b62c549eef95cf7ba7e8bad5`（2026-11-23）；扫描未使用 ignore。主构建解析 rustls-webpki 0.103.17；vendor lock 中 rustls-webpki 0.103.17、webpki-roots 1.0.10。RUSTSEC-2024-0437 的 protobuf 不在这两个依赖图中。本轮使用更新数据库的扫描见文末。
 
 开发过程还做了针对 REALITY trust probe / certificate chain / SNI hostname、target DNS self-loop 和 SSRF 边界、ClientHello / TLS length parsing、replay bounds、Vision frame bounds / random header protection、ML-DSA signature key verification 的定向代码审查和负向互通检查；详情仍需由未参与实现的第三方审计方独立复核。
 
-## v0.3.1 发布后的未发布 Vision 补丁（Windows 本地验证）
+## 2026-11-24 未发布 Vision 补丁历史记录（Windows）
 
-候选代码为 `fc534857ed817982aa5b56db5786e40f1f5e2ecf` 与后续 Vision parser fix `854802705e1be47edb096e5187d81e1d69d766ec`，位于本地分支 `security/vision-fragment-eof`，基于已发布 main commit `b466bf7e51fbf9045826ebbad41972e15bffd14d`。它**尚未推送、尚未发布，也没有 Debian/CI 验证**；包版本仍显示 0.3.1，不能将其与 0.3.1 发布二进制混为一谈。
+该轮候选代码为 `fc534857ed817982aa5b56db5786e40f1f5e2ecf` 与后续 Vision parser fix `854802705e1be47edb096e5187d81e1d69d766ec`，位于本地分支 `security/vision-fragment-eof`，基于发布来源文档 commit `b466bf7e51fbf9045826ebbad41972e15bffd14d`。该轮补丁**尚未推送、尚未发布，也没有 Debian/CI 验证**；包版本仍显示 0.3.1，不能将其与 0.3.1 发布二进制混为一谈。这两个补丁已包含在 2026-11-25 候选中，但不代表当前完整代码。
 
-- `Reader::read_direct()` 在已开始的 TLS record body 处遇到 EOF 时，现返回截断错误而非把截断记录视为干净 EOF。
+- random HeaderMask 路径的 `Reader::read_direct()` 在已开始的 TLS record body 处遇到 EOF 时，现返回截断错误而非把截断记录视为干净 EOF；native/xorpub 的 Direct 直接透传，TLS 完整性由端点校验。
 - Vision ServerHello 检测现在可跨 TLS header / record 的读分片累计最多一个受限 ServerHello record，并累计其 supported_versions 扩展；ClientHello 抓取会覆盖分片并为响应 ServerHello 保留有界检测预算。测试覆盖每个二分边界、逐字节 ClientHello/ServerHello 切分及不允许直接切换的 ChaCha TLS suite。
 - 新的 record-layer 双端合成测试经带 header masking 的加密记录进入 Direct，确认 uplink 与 downlink 状态切换、分片 TLS record header 的传输、record 边界上的 clean half-close，以及两方向的 header/body 截断报错。它证明实现路径受测，不代表官方客户端实际产生双向 Direct。
 - Windows 候选验证：34 项 Rust tests、strict Clippy、locked release build、核心 14 项和部署 16 项回归通过；官方 Xray 26.11.9 的 REALITY+Vision 30 变体、plain Vision 30 变体，以及 ML-DSA-65 native/random 子集互通通过。Chrome/Firefox/Safari REALITY quick 用例通过。
 - 官方 Xray 实际系统日志仍只观察到个别连接的 downlink Direct 转换，uplink Direct 计数仍为 0；Mux 示例没有 Direct 转换。合成双向测试不能替代真实双向互通证据，因此仍不宣称 Vision 双向 Direct parity。
 - 此补丁还没有在 Debian 13、Rust 1.89、systemd、发布包安装或 off-host 环境复测；应在发布前补齐。独立审计仍未委托或完成，审计范围草稿见仓库根目录 `SECURITY_AUDIT_BRIEF.md`。
+
+## 2026-11-25 安全候选（Windows，未发布）
+
+本轮实现与 CI 修复已冻结于 `security/vision-fragment-eof` 的提交 `87c9381e3409164bb48a0515b78e74694ce896d8`，后续文档提交记录审查范围。包版本仍为 0.3.1；候选尚未发布二进制，不能按版本字符串与已发布二进制区分。下表记录本地审查完成时的状态；推送后的 CI 状态以 GitHub 对应提交的检查结果为准。问题、修复及依赖扫描来源详见 [安全审查记录](../docs/SECURITY_REVIEW_2026-11-25.md)。
+
+修复包括 REALITY 固定 target 的默认私网地址策略、Vision 帧 EOF 与短 Direct 记录交互、配置与导入文件的限读、排他临时文件及 Unix ownership/权限保留，以及发布资产重复覆盖。另修复系统证书库为空时有效自定义 target CA 被过早拒绝的问题：先加载 native roots、严格解析并加入 custom roots，再检查最终根库是否为空，证书链与 SNI 验证继续执行。该项属于条件性的配置兼容性问题，不是认证绕过。
+
+| 检查 | 本轮结果 |
+| --- | --- |
+| Rust 单元测试 | 45 项通过 |
+| Rust 格式、strict Clippy、locked/offline release build | 全部通过 |
+| 核心 CLI/网络回归 | 17 项：16 通过，1 项 Unix ownership/permissions 用例在 Windows 跳过 |
+| 部署/菜单回归 | 16 项通过 |
+| 官方 Xray 普通 Encryption / Vision / REALITY + Vision | 同一最终 release 各 30 变体，共 90 项通过 |
+| 官方 Xray 八层 relay-only | 6 项通过 |
+| 官方 Xray 独立 REALITY quick | Chrome 1 项通过，含不相关 CA 导致 `UnknownIssuer` 的拒绝检查 |
+| 官方 Xray REALITY + Vision + ML-DSA-65 quick | native 4 项、random 4 项通过，每项包含错误 `pqv` 拒绝检查 |
+| 脚本与工作流静态检查 | 6 个 Python 文件 AST、1 个 YAML、3 个 Bash 脚本及 10 个工作流 Bash 块通过 |
+| Linux CI 与发布流程 | 本地 YAML/Bash/tag 检查通过，未在 GitHub 执行 |
+
+本轮 105 个互通用例均使用同一最终 release 二进制，SHA-256 为：
+
+```text
+eea8652a02fb4c61cbc674d8b4efca1d911e7b7f2ec7ca615bf673dfa867c7f2
+```
+
+互通默认路径已改为 release，并输出二进制版本、SHA-256 和逐 suite 的结果/metadata，避免不同组合相互覆盖。排查时发现旧 debug 路径留有 0.2.0 二进制，该旧程序的 30 变体结果不计入本轮证据。复测可在 `rust-core` 目录使用以下命令，显式指定候选二进制：
+
+```powershell
+python tools/interop.py --rust target/release/vless-rust.exe
+python tools/interop.py --rust target/release/vless-rust.exe --vision
+python tools/interop.py --rust target/release/vless-rust.exe --reality --vision --fingerprint chrome
+python tools/interop.py --rust target/release/vless-rust.exe --relays-only
+python tools/interop.py --rust target/release/vless-rust.exe --reality --quick --fingerprint chrome
+python tools/interop.py --rust target/release/vless-rust.exe --reality --vision --mldsa65 --quick --fingerprint chrome --appearance native
+python tools/interop.py --rust target/release/vless-rust.exe --reality --vision --mldsa65 --quick --fingerprint chrome --appearance random
+```
+
+本地机器可读记录位于 `.build/interop/`，文件名分别以 `plain`、`vision-plain`、`vision-reality-chrome`、`relay`、`reality-chrome-quick`、`vision-mldsa65-reality-chrome-quick-native`、`vision-mldsa65-reality-chrome-quick-random` 开头，各有 `-results.json` 和 `-metadata.json`。这些运行产物被 Git 忽略。本轮 REALITY 仅使用 Chrome 指纹和 Windows localhost 目标，不扩展为本轮 Firefox/Safari、其他公网目标或 Linux 互通证据。
+
+2026-11-25 12:53:53 UTC，使用官方 cargo-audit 0.23.0 与 RustSec 固定快照 `b9b8a3c2cb1f2a3c76ab17a551193568c9f8b7a4`（2026-11-25 11:10:30 UTC；1,548 条 advisory）扫描应用锁文件 131 个包、vendor 锁文件 134 个包，两次均为 0 漏洞、0 警告、退出码 0。未忽略 advisory 或排除 OS/CPU；`--no-fetch --no-yanked --json` 禁用了撤回版本检查。官方工具和数据库快照 SHA-256、锁文件哈希及原始 JSON 位置记于 [审查记录](../docs/SECURITY_REVIEW_2026-11-25.md#已知依赖漏洞检查)。这不覆盖项目代码、密码学设计或自定义 rustls 修改。
+
+实际运行 TLS provider 为 Ring/std；AWS-LC 仅源码审查。Windows 无法验证 Unix uid/gid、权限与目录同步路径，Linux CI 已加入相应用例，但尚无 GitHub 执行结果。本轮未在 Debian/systemd、Rust 1.89、发布包安装或 off-host 环境复测。官方客户端真实双向 Direct、完整 REALITY 指纹兼容性、长时间运行及移动网络行为仍未建立；合成双向测试不能代替这些证据。
