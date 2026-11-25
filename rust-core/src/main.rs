@@ -162,7 +162,7 @@ fn replace_config(path: &Path, config: &Config) -> Result<()> {
         metadata.file_type().is_file(),
         "configuration must be a regular file"
     );
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -170,17 +170,35 @@ fn replace_config(path: &Path, config: &Config) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    let mut file = options
+        .open(&temporary)
+        .context("create replacement configuration")?;
     let result = (|| -> Result<()> {
-        let mut file = options
-            .open(&temporary)
-            .context("create replacement configuration")?;
         let bytes = Zeroizing::new(serde_json::to_vec_pretty(config)?);
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let replacement = file.metadata()?;
+            if replacement.uid() != metadata.uid() || replacement.gid() != metadata.gid() {
+                std::os::unix::fs::chown(&temporary, Some(metadata.uid()), Some(metadata.gid()))
+                    .context("preserve configuration ownership")?;
+            }
+            // Preserve service group read access, never world access or
+            // executable/group-writable bits on a file containing keys.
+            file.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o640))?;
+            file.sync_all()?;
+        }
+        drop(file);
         fs::rename(&temporary, path).context("commit replacement configuration")?;
         #[cfg(unix)]
-        if let Some(parent) = path.parent() {
+        {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
             fs::File::open(parent)?.sync_all()?;
         }
         Ok(())
@@ -197,11 +215,7 @@ fn import_xray_config(
     listen_host: std::net::IpAddr,
     port: Option<u16>,
 ) -> Result<()> {
-    let source = Zeroizing::new(fs::read(input).context("read existing Xray configuration")?);
-    ensure!(
-        source.len() <= 1024 * 1024,
-        "Xray configuration exceeds 1 MiB"
-    );
+    let source = config::read_file(input).context("read existing Xray configuration")?;
     let value: serde_json::Value = serde_json::from_slice(&source)?;
     ensure!(value.is_object(), "Xray configuration must be an object");
     let root = value.as_object().context("invalid Xray configuration")?;
@@ -414,7 +428,14 @@ async fn serve(config: Config) -> Result<()> {
     let reality = config
         .reality
         .clone()
-        .map(|c| reality::Server::new(c, config.limits.max_sessions, config.listen))
+        .map(|c| {
+            reality::Server::new(
+                c,
+                config.limits.max_sessions,
+                config.listen,
+                config.limits.allow_private_destinations,
+            )
+        })
         .transpose()?
         .map(Arc::new);
     let server = Arc::new(handshake::Server::new(
@@ -772,7 +793,12 @@ fn main() -> Result<()> {
             let config = Config::load(path)?;
             if command == "check" {
                 if let Some(reality) = config.reality.clone() {
-                    reality::Server::new(reality, config.limits.max_sessions, config.listen)?;
+                    reality::Server::new(
+                        reality,
+                        config.limits.max_sessions,
+                        config.listen,
+                        config.limits.allow_private_destinations,
+                    )?;
                 }
                 handshake::Server::new(
                     EncryptionConfig::parse(&config.decryption)?,

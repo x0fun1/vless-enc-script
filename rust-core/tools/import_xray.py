@@ -53,7 +53,11 @@ def main():
     p.add_argument("--output", required=True, type=pathlib.Path)
     p.add_argument("--listen", help="Optional separate test listener, e.g. 127.0.0.1:18443")
     a = p.parse_args()
-    result = convert(json.loads(a.input.read_text(encoding="utf-8")), a.listen)
+    with a.input.open("rb") as source:
+        data = source.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024:
+        p.error("Xray configuration exceeds 1 MiB")
+    result = convert(json.loads(data), a.listen)
     fd = os.open(a.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)

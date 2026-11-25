@@ -2,6 +2,8 @@
 
 独立 Rust 实现的 VLESS Encryption 核心，协议参照 Xray-core `v26.11.9`。支持 TCP、UDP、Mux、XUDP；另提供**实验性的 XTLS Vision（直连 TCP）**和 **REALITY + VLESS Encryption**，REALITY 可选 ML-DSA-65 证书证明。不启动或嵌入 Go Xray。客户端必须支持 VLESS Encryption 的 `encryption` 参数。
 
+当前工作分支包含 v0.3.1 发布后的安全修复候选，尚未发布；包版本暂仍为 **0.3.1**。下述本轮目标地址策略及代码修复不能视为已经包含在远程安装取得的 v0.3.1 二进制中。
+
 > 当前公开菜单提供三类节点：普通 Encryption、REALITY + Vision（X25519 Encryption 认证）、REALITY + Vision（ML-KEM-768 Encryption 认证）。后两类均可选择启用额外 ML-DSA-65 证明（默认关闭）。组合已在 Windows localhost 对 Xray-core v26.11.9 完成 30 个官方客户端变体互通，并在 Debian 13 上通过 30 组组合互通及三种 systemd 节点访问 `www.nvidia.com`。ML-DSA-65 另覆盖正确 / 错误验证密钥。Vision 日志只观测到 downlink Direct 转换，uplink Direct 与完整 TLS 指纹等价并未证明。REALITY 仅在已测 TLS 目标形态下复刻 ServerHello / 初始记录特征，不是完整指纹等价、抗探测保证或安全审计。ML-DSA-65 大证书可能导致部分目标的记录长度无法匹配。其他公网目标、长时运行和独立安全审计仍待验证。
 
 ## 一条命令安装，菜单中创建节点
@@ -74,13 +76,21 @@ journalctl -u vless-rust@node-<ID> -f --no-pager
 
 服务以独立的 `vless-rust` 系统账户运行。请在云安全组和主机防火墙放行每个节点所选 TCP 端口。更新核心会保留配置及启用状态，并重启原来正在运行的节点，因此会短暂中断这些节点的现有连接；原来停止的节点不会被启动。
 
+## 局域网客户端与目标地址策略
+
+局域网客户端可以使用服务器的内网地址连接本服务，是否可达取决于监听地址、防火墙及客户端认证。`limits.allow_private_destinations` 限制的是服务器向外连接的目标地址，不按客户端来源地址禁止局域网接入。
+
+本轮候选默认阻止代理请求及 REALITY fallback、目标握手采样和元数据探测连接内网、回环与特殊用途目标。确需访问内网目标时，可在配置中显式设置 `limits.allow_private_destinations: true`；这也允许未经认证的 REALITY fallback 连接配置的内网 target，须按该用途选择目标。指向本服务监听地址的 REALITY 循环转发仍会被拒绝。
+
 ## 本地构建与验证
 
 ```bash
 cd rust-core
+cargo fmt -- --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --release --locked
+python3 tools/fetch_reference.py
 python3 tools/regression.py
 python3 ../tests/regression.py
 ```
@@ -96,4 +106,4 @@ python3 tools/interop.py --rust target/release/vless-rust --reality --vision --m
 python3 tools/regression.py
 ```
 
-互通测试使用固定的 Xray-core v26.11.9。Windows localhost 和 Debian 13 / `www.nvidia.com` 的结果不代表其他公网目标兼容或完整 fingerprint parity。v0.3.1 已发布；远程一键安装入口现可获取对应二进制和部署包。核心尚未经过独立安全审计；验证记录见 [rust-core/VALIDATION.md](rust-core/VALIDATION.md)，审计缺口和报告流程见 [SECURITY.md](SECURITY.md)。
+互通测试使用固定的 Xray-core v26.11.9。Windows localhost 和 Debian 13 / `www.nvidia.com` 的结果不代表其他公网目标兼容或完整 fingerprint parity。已发布 v0.3.1 的二进制和部署包可由远程一键安装入口获取；2026-11-24 的 Debian 13 / systemd 记录属于该发布基线，不代表本轮候选已在 Linux 验证。核心尚未经过独立安全审计；实际验证记录见 [rust-core/VALIDATION.md](rust-core/VALIDATION.md)，审计缺口和报告流程见 [SECURITY.md](SECURITY.md)。仓库地图、Windows 前置条件和不可覆盖的版本发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。

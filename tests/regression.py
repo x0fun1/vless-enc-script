@@ -2,6 +2,7 @@
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -12,6 +13,19 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 MANAGER = ROOT / "rust-core/venc"
+BASH = shutil.which("bash") or "bash"
+if os.name == "nt":
+    # Git's bin/bash.exe launcher prepends real system commands to PATH,
+    # bypassing the command fakes. Use the actual MSYS Bash binary instead.
+    bash_candidates = [pathlib.Path(BASH).parent.parent / "usr/bin/bash.exe"]
+    git = shutil.which("git")
+    if git:
+        bash_candidates.append(pathlib.Path(git).parent.parent / "usr/bin/bash.exe")
+    for msys_bash in bash_candidates:
+        if msys_bash.is_file():
+            BASH = str(msys_bash)
+            os.environ["PATH"] = str(msys_bash.parent) + os.pathsep + os.environ.get("PATH", "")
+            break
 
 # No real root/systemd/network changes: every external privileged command is
 # substituted. The real bash manager and its filesystem operations are tested.
@@ -90,7 +104,7 @@ else: raise AssertionError(kind)
 
 class DeploymentInstallerTests(unittest.TestCase):
     def run_installer(self, *args):
-        return subprocess.run(["bash", str(INSTALLER), *args], capture_output=True, encoding="utf-8", timeout=15)
+        return subprocess.run([BASH, str(INSTALLER), *args], capture_output=True, encoding="utf-8", timeout=15)
 
     def test_help_describes_menu_first_and_reality_limits(self):
         result = self.run_installer("--help")
@@ -109,9 +123,9 @@ class DeploymentInstallerTests(unittest.TestCase):
         cargo = (ROOT / "rust-core/Cargo.toml").read_text(encoding="utf-8")
         install = (ROOT / "rust-core/install.sh").read_text(encoding="utf-8")
         source = INSTALLER.read_text(encoding="utf-8")
-        self.assertRegex(cargo, r'(?m)^version = "0\.3\.1"$')
-        self.assertIn("vless-rust 0.3.1 reference Xray-core v26.11.9", install)
-        self.assertIn('CORE_VERSION="0.3.1"', source)
+        version = re.search(r'(?m)^version = "([^"]+)"$', cargo).group(1)
+        self.assertIn(f"vless-rust {version} reference Xray-core v26.11.9", install)
+        self.assertIn(f'CORE_VERSION="{version}"', source)
         self.assertIn('releases/download/vless-rust-v${CORE_VERSION}', source)
         self.assertIn('vless-rust-deploy.tar.gz', source)
         self.assertIn('"$release_url/$asset.sha256"', source)
@@ -127,7 +141,7 @@ class DeploymentInstallerTests(unittest.TestCase):
     def test_all_install_scripts_parse(self):
         for path in (INSTALLER, ROOT / "rust-core/install.sh", MANAGER):
             with self.subTest(path=path):
-                result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True, timeout=15)
+                result = subprocess.run([BASH, "-n", str(path)], capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
 
@@ -153,11 +167,21 @@ class ManagerTests(unittest.TestCase):
         self.nodes = self.root / "usr/local/etc/vless-rust/nodes"
         self.env = os.environ.copy()
         # Bash on Windows uses a POSIX PATH rather than os.pathsep=';'.
-        old_path = subprocess.check_output(["bash", "-c", 'printf "%s" "$PATH"'], text=True)
-        self.env.update(VENC_ROOT=self.root.as_posix(), VENC_VERIFY_DELAY="0", PYTHONIOENCODING="utf-8", PATH=f"{self.mock_bin.as_posix()}:{old_path}")
+        old_path = subprocess.check_output([BASH, "-c", 'printf "%s" "$PATH"'], text=True)
+        mock_path = self.mock_bin.as_posix()
+        if os.name == "nt":
+            # A Windows drive colon would split this entry in Bash's PATH.
+            mock_path = subprocess.check_output(
+                [BASH, "-c", 'cygpath -u -- "$1"', "bash", mock_path], text=True
+            ).strip()
+            bash_path = subprocess.check_output(
+                [BASH, "-c", 'cygpath -u -- "$1"', "bash", str(pathlib.Path(BASH).parent)], text=True
+            ).strip()
+            old_path = f"{bash_path}:{old_path}"
+        self.env.update(VENC_ROOT=self.root.as_posix(), VENC_VERIFY_DELAY="0", PYTHONIOENCODING="utf-8", PATH=f"{mock_path}:{old_path}")
 
     def run_menu(self, inputs, **environment):
-        result = subprocess.run(["bash", str(MANAGER)], input=inputs.encode("utf-8"), capture_output=True, timeout=30, env=self.env | environment)
+        result = subprocess.run([BASH, str(MANAGER)], input=inputs.encode("utf-8"), capture_output=True, timeout=30, env=self.env | environment)
         result.stdout = result.stdout.decode("utf-8")
         result.stderr = result.stderr.decode("utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)

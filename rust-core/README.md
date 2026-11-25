@@ -4,6 +4,8 @@
 
 当前功能均以 opt-in 方式启用；v0.3.1 已发布，但尚未经过独立安全审计。普通 Encryption 基线和后续实验功能的验证范围分别记录于 [VALIDATION.md](VALIDATION.md)。Debian 13 上的 v0.3.1 systemd 三节点及 NVIDIA target smoke 已完成；临时节点已删除并恢复原 0.2.0 安装。长时间运行、移动网络、其他公网目标和完整 fingerprint parity 尚未验证；off-host 入站测试未做。
 
+当前工作分支包含发布后的安全修复候选，包版本暂仍为 0.3.1，尚未发布。本轮候选的变更与本地检查结果单独记录于验证文档；2026-11-24 的 Debian 13 / systemd 结果只覆盖已发布基线。
+
 ## 已支持的范围
 
 - 普通 VLESS Encryption：`mlkem768x25519plus` 混合密钥交换。
@@ -70,6 +72,8 @@ cargo build --release --locked
 省略此字段是普通 Encryption 节点。时间窗口必须为 `1..3600` 秒；服务器应保持时间同步。认证失败、SNI / short ID 不匹配、过期或重放的 ClientHello 不会进入 VLESS 转发，而是把原始连接转发到配置的目标站。此转发受握手超时和连接 / 握手并发限制，因此不是无限期的通用目标站代理。
 
 REALITY authenticated path currently depends on the configured target: it connects there to capture handshake characteristics; unauthenticated connections still relay their original bytes to that target. The separate ALPN/SNI metadata probe validates the target's certificate chain and hostname using platform trust roots; up to 32 profiles are cached for ten minutes, keyed by the selected target address, SNI and ALPN offer. For a private or test target, `target_ca_certificates` may add up to 16 explicitly trusted DER certificates encoded as unpadded base64url. No application data is sent in the probe. Certificate verification on the independent metadata connection does not prove the target handles the capture and probe ClientHello identically. Unavailable or unsupported TLS targets cause the authenticated handshake to fail. The target resolver rejects any resolved address that would loop back to this listener.
+
+本轮候选将 `limits.allow_private_destinations` 同时应用到 REALITY 未认证 fallback、目标握手采样和元数据探测，默认拒绝内网及特殊用途 target。显式设为 `true` 才允许此类目标；此选择也允许未经认证的连接经 fallback 到达配置的内网 target，不能仅按已认证代理流量评估。元数据探测连接使用采样时选中的同一目标地址；本服务监听地址的循环转发检查不受该开关影响。
 
 本机 Windows OpenSSL TLS echo target 实际协商 `X25519`；Debian 的 `www.nvidia.com` target 实际协商 `X25519MLKEM768`。两类 REALITY + Vision 均通过 Xray v26.11.9 客户端；NVIDIA 用例也观察到 SNI acknowledgement 和匹配的 ServerHello / 初始记录长度。其他目标、完整 TLS 流量形态和完整指纹等价仍未验证。
 
@@ -155,11 +159,11 @@ sudo systemctl enable --now vless-rust
 | `max_mux_streams` | 32 | 每条 Mux 连接的子流上限 |
 | `max_sessions` | 1024 | 保存的 0-RTT 会话上限 |
 | `max_resumes_per_session` | 1024 | 每个会话保存的防重放记录上限 |
-| `allow_private_destinations` | false | 是否允许内网、回环与特殊用途目标 |
+| `allow_private_destinations` | false | 是否允许代理及 REALITY fallback / 采样 / 探测连接内网、回环与特殊用途目标（REALITY 部分为本轮候选变更） |
 
 TCP keepalive 不会重置应用空闲计时，也不能维持已经断开的 TCP 会话。需要超过 15 分钟无数据仍保持的应用可增大 `idle_timeout_secs`；增大会让空闲连接占用资源更久。UDP 没有 TCP keepalive。
 
-默认阻止内网 / 特殊用途 IP 和内网域名，范围参照固定 Xray 版本；如果确实需要访问内网，可显式设置 `limits.allow_private_destinations: true`。阻止时立即记录错误并关闭，不使用 Xray 的随机黑洞等待。
+默认阻止内网 / 特殊用途目标 IP 和内网域名，范围参照固定 Xray 版本；如果确实需要访问内网，可显式设置 `limits.allow_private_destinations: true`。阻止时立即记录错误并关闭，不使用 Xray 的随机黑洞等待。此策略限制服务器的出站目标，不限制客户端来源地址：局域网客户端仍可使用服务器内网地址连接本服务，由监听地址、防火墙和客户端认证决定能否访问。对 REALITY 开启该开关还会放行未经认证的 fallback 到配置的内网 target。
 
 每 30 秒输出 `stats active/accepted/errors/resumed/retry`：`retry` 统计服务端拒绝未知 / 过期 0-RTT 票据并通知客户端弃用票据的次数，不计为服务错误；它统计的是服务端发出的回退信号，不保证原请求自动重放。官方 Xray v26.11.9 收到此信号后会清除旧票据，但当前请求可能中断，后续新连接再使用完整握手。设置顶层 `log_connections: true` 可记录每次握手使用 `1rtt` / `0rtt` 和密码算法。错误日志区分 `handshake timeout`、`invalid VLESS user`、`AEAD authentication failed`、`private destination blocked`、DNS / 出站超时、应用空闲超时和半关闭空闲超时，不输出私钥。客户端网络重置单独标明发生在客户端读、写或对端流量路径。
 
@@ -169,8 +173,10 @@ TCP keepalive 不会重置应用空闲计时，也不能维持已经断开的 TC
 
 ```bash
 cd rust-core
+cargo fmt -- --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
+cargo build --release --locked
 python3 tools/fetch_reference.py
 python3 tools/interop.py --rust target/release/vless-rust
 python3 tools/interop.py --rust target/release/vless-rust --reality
@@ -182,4 +188,4 @@ python3 ../tests/regression.py
 
 参考下载器固定官方 `v26.11.9`，在解压前核对 GitHub 发布资产的 SHA-256；参考程序只用于测试。测试和测量生成的日志 / JSON 位于仓库 `.build/`，不会提交真实测试凭据。性能脚本只对本机回环的同一客户端与负载做比较，不能代表公网线路或 Linux 生产效果。
 
-协议来源和许可见 [NOTICE.md](NOTICE.md)。
+协议来源和许可见 [NOTICE.md](NOTICE.md)。仓库地图、Windows 开发环境及版本发布步骤见 [CONTRIBUTING.md](../CONTRIBUTING.md)。

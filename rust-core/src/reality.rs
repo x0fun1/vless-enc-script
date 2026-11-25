@@ -306,6 +306,7 @@ pub struct Server {
     max_seen: usize,
     target_profile_cache: Mutex<HashMap<TargetProfileKey, TargetTlsProfile>>,
     listen: std::net::SocketAddr,
+    allow_private_destinations: bool,
 }
 
 // Small, fixed Ed25519 X.509 template; the certificate signature is the REALITY
@@ -369,6 +370,7 @@ impl Server {
         config: RealityConfig,
         max_seen: usize,
         listen: std::net::SocketAddr,
+        allow_private_destinations: bool,
     ) -> Result<Self> {
         config.validate()?;
         let private = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
@@ -391,6 +393,7 @@ impl Server {
             max_seen: max_seen.max(1),
             target_profile_cache: Mutex::new(HashMap::new()),
             listen,
+            allow_private_destinations,
         })
     }
     fn authenticate(&self, hello: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
@@ -470,16 +473,28 @@ impl Server {
                 || (self.listen.ip().is_unspecified() && loopback(target.ip())))
     }
     async fn connect_target(&self, accepted_local: SocketAddr) -> Result<TcpStream> {
+        let (host, _) = self
+            .config
+            .target
+            .rsplit_once(':')
+            .context("REALITY target must be HOST:PORT")?;
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        ensure!(
+            self.allow_private_destinations
+                || host.parse::<IpAddr>().is_ok()
+                || !crate::destination::private_domain(host),
+            "REALITY target uses a private or special-use domain"
+        );
         let mut addresses = timeout(Duration::from_secs(3), lookup_host(&self.config.target))
             .await
             .context("REALITY target DNS lookup timed out")??
             .take(64);
         let mut candidates = Vec::new();
         for address in &mut addresses {
-            ensure!(
-                !self.is_listener_target(address, accepted_local),
-                "REALITY target cannot point to this listener"
-            );
+            self.validate_target_address(address, accepted_local)?;
             candidates.push(address);
         }
         ensure!(
@@ -507,6 +522,22 @@ impl Server {
             }
         }
         Err(last_error.context("connect REALITY target failed")?.into())
+    }
+
+    fn validate_target_address(
+        &self,
+        target: SocketAddr,
+        accepted_local: SocketAddr,
+    ) -> Result<()> {
+        ensure!(
+            !self.is_listener_target(target, accepted_local),
+            "REALITY target cannot point to this listener"
+        );
+        ensure!(
+            self.allow_private_destinations || !crate::destination::private_ip(target.ip()),
+            "REALITY target resolved to a private or special-use address"
+        );
+        Ok(())
     }
 
     pub async fn accept(&self, mut socket: TcpStream) -> Result<Option<TlsStream<Replay>>> {
@@ -867,20 +898,12 @@ struct TargetTlsProfile {
     observed_at: Instant,
 }
 
-async fn probe_target_alpn(
-    target: SocketAddr,
-    server_name: &str,
-    protocols: &[Vec<u8>],
+fn target_root_store(
+    native_certificates: impl IntoIterator<Item = CertificateDer<'static>>,
     custom_roots: &[String],
-) -> Result<TargetTlsProfile> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+) -> Result<rustls::RootCertStore> {
     let mut roots = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    let (loaded, _ignored) = roots.add_parsable_certificates(native.certs);
-    ensure!(
-        loaded > 0,
-        "no usable platform root certificates for REALITY target probe"
-    );
+    roots.add_parsable_certificates(native_certificates);
     for encoded in custom_roots {
         let der = URL_SAFE_NO_PAD
             .decode(encoded)
@@ -889,6 +912,22 @@ async fn probe_target_alpn(
             .add(CertificateDer::from(der))
             .context("add configured REALITY target root certificate")?;
     }
+    ensure!(
+        !roots.is_empty(),
+        "no usable root certificates for REALITY target probe"
+    );
+    Ok(roots)
+}
+
+async fn probe_target_alpn(
+    target: SocketAddr,
+    server_name: &str,
+    protocols: &[Vec<u8>],
+    custom_roots: &[String],
+) -> Result<TargetTlsProfile> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let native = rustls_native_certs::load_native_certs();
+    let roots = target_root_store(native.certs, custom_roots)?;
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
@@ -1211,6 +1250,42 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn target_probe_roots_accept_explicit_trust_without_platform_certificates() {
+        // Trust-anchor parsing only needs a structurally valid certificate.
+        // Reuse the local DER template with a synthetic public key/signature.
+        let mut body = cert_body(&[0x42; 32], None);
+        body.extend(der(0x03, &[0; 65]));
+        let certificate = CertificateDer::from(der(0x30, &body));
+        let encoded = URL_SAFE_NO_PAD.encode(certificate.as_ref());
+        assert_eq!(
+            target_root_store(Vec::new(), std::slice::from_ref(&encoded))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(target_root_store(Vec::new(), &[]).is_err());
+        assert_eq!(
+            target_root_store(vec![certificate.clone()], &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        // Invalid platform entries may be ignored; explicit trust must remain
+        // strict even when a valid platform root is already available.
+        assert!(
+            target_root_store(
+                vec![CertificateDer::from(vec![0; 64])],
+                std::slice::from_ref(&encoded),
+            )
+            .is_ok()
+        );
+        for invalid in ["not-base64url!".to_owned(), URL_SAFE_NO_PAD.encode([0; 64])] {
+            assert!(target_root_store(vec![certificate.clone()], &[invalid]).is_err());
+        }
+    }
+
     #[test]
     fn mldsa65_seed_derives_a_fixed_size_verification_key_and_signature() {
         use ml_dsa::Verifier;
@@ -1327,7 +1402,8 @@ mod tests {
             .unwrap()
             .as_secs();
         let sid = config.sid().unwrap();
-        let server = Server::new(config.clone(), 1, "127.0.0.1:443".parse().unwrap()).unwrap();
+        let server =
+            Server::new(config.clone(), 1, "127.0.0.1:443".parse().unwrap(), false).unwrap();
         for (timestamp, wrong_sid) in [(now - 301, sid), (now + 301, sid), (now, [0; 8])] {
             assert!(
                 server
@@ -1353,7 +1429,7 @@ mod tests {
     fn reality_target_loop_guard_detects_wildcard_loopback_and_exact_local_address() {
         let config =
             RealityConfig::generate("example.com".into(), "example.com:443".into()).unwrap();
-        let server = Server::new(config, 1, "0.0.0.0:443".parse().unwrap()).unwrap();
+        let server = Server::new(config, 1, "0.0.0.0:443".parse().unwrap(), true).unwrap();
         let accepted = "192.0.2.10:443".parse().unwrap();
         assert!(server.is_listener_target("127.0.0.1:443".parse().unwrap(), accepted));
         assert!(server.is_listener_target("192.0.2.10:443".parse().unwrap(), accepted));
@@ -1371,6 +1447,7 @@ mod tests {
             config,
             1,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), actual.port()),
+            true,
         )
         .unwrap();
         assert!(
@@ -1384,6 +1461,78 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reality_target_policy_checks_every_resolved_address() {
+        let config =
+            RealityConfig::generate("example.com".into(), "example.com:443".into()).unwrap();
+        let listen = "0.0.0.0:443".parse().unwrap();
+        let accepted = "192.0.2.7:443".parse().unwrap();
+        let restricted = Server::new(config.clone(), 1, listen, false).unwrap();
+        let opted_in = Server::new(config, 1, listen, true).unwrap();
+        for target in [
+            "127.0.0.1:80",
+            "10.1.2.3:443",
+            "169.254.169.254:80",
+            "[::1]:80",
+            "[::ffff:192.168.1.1]:80",
+            "[fe80::1]:443",
+        ] {
+            let target = target.parse().unwrap();
+            assert!(
+                restricted
+                    .validate_target_address(target, accepted)
+                    .is_err()
+            );
+            assert!(opted_in.validate_target_address(target, accepted).is_ok());
+        }
+        assert!(
+            restricted
+                .validate_target_address("1.1.1.1:443".parse().unwrap(), accepted)
+                .is_ok()
+        );
+        // The explicit private-network opt-in must never bypass the loop guard.
+        assert!(
+            opted_in
+                .validate_target_address("127.0.0.1:443".parse().unwrap(), accepted)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reality_private_target_is_blocked_before_connect_and_allows_explicit_opt_in() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = RealityConfig::generate("example.com".into(), address.to_string()).unwrap();
+        let listen = "0.0.0.0:443".parse().unwrap();
+        let accepted = "192.0.2.7:443".parse().unwrap();
+        let server = Server::new(config.clone(), 1, listen, false).unwrap();
+        assert!(server.connect_target(accepted).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        let server = Server::new(config, 1, listen, true).unwrap();
+        let socket = server.connect_target(accepted).await.unwrap();
+        let (connection, _) = timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop((socket, connection));
+    }
+
+    #[tokio::test]
+    async fn reality_private_domain_is_rejected_before_resolution() {
+        let config =
+            RealityConfig::generate("example.com".into(), "service.localhost:443".into()).unwrap();
+        let server = Server::new(config, 1, "0.0.0.0:443".parse().unwrap(), false).unwrap();
+        let error = server
+            .connect_target("192.0.2.7:443".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("special-use domain"));
     }
 
     #[tokio::test]

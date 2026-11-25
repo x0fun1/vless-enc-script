@@ -124,10 +124,17 @@ impl Reader {
                     .read(&mut output[written..written + available])
                     .await?;
                 if n == 0 {
+                    ensure!(
+                        self.direct_body_remaining == 0,
+                        "unexpected EOF in direct TLS record body"
+                    );
                     return Ok(written);
                 }
                 self.direct_body_remaining -= n;
                 written += n;
+                // A short complete TLS record must reach the destination
+                // without waiting for another record to fill the caller buffer.
+                return Ok(written);
             }
         }
         Ok(written)
@@ -150,6 +157,9 @@ impl Reader {
             let mut header = [0; 5];
             let n = self.socket.read(&mut header[..1]).await?;
             if n == 0 {
+                if let Some(vision) = &self.vision {
+                    vision.finish()?;
+                }
                 return Ok(0);
             }
             self.socket.read_exact(&mut header[1..]).await?;
@@ -324,6 +334,10 @@ impl Writer {
 
     pub async fn shutdown(&mut self) -> Result<()> {
         self.socket.shutdown().await?;
+        ensure!(
+            self.direct_header_len == 0 && self.direct_body_remaining == 0,
+            "unexpected EOF in outgoing direct TLS record"
+        );
         Ok(())
     }
 }
@@ -333,8 +347,9 @@ mod tests {
     use super::*;
     use crate::{
         config::Limits,
-        crypto::{Algorithm, derive_key},
+        crypto::{Algorithm, derive_key, header_mask},
         forward::{self, Activity, Target},
+        vision::{Decoder as VisionDecoder, Encoder as VisionEncoder, SharedState},
     };
     use tokio::{
         net::{TcpListener, TcpStream},
@@ -375,6 +390,82 @@ mod tests {
         )
     }
 
+    async fn vision_direct_pair() -> (Reader, Writer, Reader, Writer, SharedState, SharedState) {
+        let (mut client_reader, mut client_writer, mut server_reader, mut server_writer) =
+            pair(Algorithm::Aes).await;
+        let uuid = [0x31; 16];
+        let client_state = SharedState::new();
+        let server_state = SharedState::new();
+
+        let up_key = [0x41; 32];
+        let up_iv = [0x11; 16];
+        client_writer.mask = Some(header_mask(&up_key, &up_iv));
+        server_reader.mask = Some(header_mask(&up_key, &up_iv));
+        let down_key = [0x52; 32];
+        let down_iv = [0x22; 16];
+        server_writer.mask = Some(header_mask(&down_key, &down_iv));
+        client_reader.mask = Some(header_mask(&down_key, &down_iv));
+
+        client_writer.vision = Some(VisionEncoder::new(uuid, client_state.clone(), true));
+        client_reader.vision = Some(VisionDecoder::new(uuid, client_state.clone(), false));
+        server_reader
+            .enable_vision(uuid, server_state.clone())
+            .unwrap();
+        server_writer
+            .enable_vision(uuid, server_state.clone())
+            .unwrap();
+
+        let client_hello = [22, 3, 1, 0, 4, 1, 0, 0, 0];
+        client_writer.write_all(&client_hello).await.unwrap();
+        let mut received_client_hello = vec![0; client_hello.len()];
+        server_reader
+            .read_exact(&mut received_client_hello)
+            .await
+            .unwrap();
+        assert_eq!(received_client_hello, client_hello);
+
+        let mut server_hello = vec![0; 86];
+        server_hello[..6].copy_from_slice(&[22, 3, 3, 0, 81, 2]);
+        server_hello[43] = 32;
+        server_hello[76..78].copy_from_slice(&0x1301u16.to_be_bytes());
+        server_hello[80..86].copy_from_slice(&[0, 0x2b, 0, 2, 3, 4]);
+        server_writer.write_all(&server_hello).await.unwrap();
+        let mut received_server_hello = vec![0; server_hello.len()];
+        client_reader
+            .read_exact(&mut received_server_hello)
+            .await
+            .unwrap();
+        assert_eq!(received_server_hello, server_hello);
+
+        let app_record = |byte| {
+            let mut record = vec![23, 3, 3, 0, 17];
+            record.extend([byte; 17]);
+            record
+        };
+        let client_direct = app_record(0xa1);
+        client_writer.write_all(&client_direct).await.unwrap();
+        let mut received = vec![0; client_direct.len()];
+        server_reader.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, client_direct);
+        assert_eq!(server_state.direct_uplink(), 1);
+
+        let server_direct = app_record(0xb2);
+        server_writer.write_all(&server_direct).await.unwrap();
+        let mut received = vec![0; server_direct.len()];
+        client_reader.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, server_direct);
+        assert_eq!(client_state.direct_downlink(), 1);
+
+        (
+            client_reader,
+            client_writer,
+            server_reader,
+            server_writer,
+            client_state,
+            server_state,
+        )
+    }
+
     #[test]
     fn raw_context_kdf_matches_upstream_across_chunk_boundaries() {
         for size in [0, 16, 63, 64, 65, 1023, 1024, 1025, 1216, 16384, 16645] {
@@ -409,6 +500,165 @@ mod tests {
         assert!(direct_record_length(&[22, 3, 3, 0, 32]).is_err());
         assert!(direct_record_length(&[23, 3, 3, 0, 16]).is_err());
         assert!(direct_record_length(&[23, 3, 3, 0x41, 1]).is_err());
+    }
+
+    #[tokio::test]
+    async fn vision_direct_random_masking_handles_fragmented_headers_both_ways() {
+        let (mut client_reader, mut client_writer, mut server_reader, mut server_writer, _, _) =
+            vision_direct_pair().await;
+        let make_record = |byte| {
+            let mut record = vec![23, 3, 3, 0, 17];
+            record.extend([byte; 17]);
+            record
+        };
+
+        let uplink = make_record(0xc3);
+        client_writer.write_all(&uplink[..2]).await.unwrap();
+        client_writer.write_all(&uplink[2..4]).await.unwrap();
+        client_writer.write_all(&uplink[4..5]).await.unwrap();
+        client_writer.write_all(&uplink[5..8]).await.unwrap();
+        client_writer.write_all(&uplink[8..]).await.unwrap();
+        let mut received = vec![0; uplink.len()];
+        server_reader.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, uplink);
+
+        let downlink = make_record(0xd4);
+        server_writer.write_all(&downlink[..1]).await.unwrap();
+        server_writer.write_all(&downlink[1..3]).await.unwrap();
+        server_writer.write_all(&downlink[3..5]).await.unwrap();
+        server_writer.write_all(&downlink[5..12]).await.unwrap();
+        server_writer.write_all(&downlink[12..]).await.unwrap();
+        let mut received = vec![0; downlink.len()];
+        client_reader.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, downlink);
+    }
+
+    #[tokio::test]
+    async fn vision_direct_small_records_do_not_wait_for_the_next_record() {
+        let (mut client_reader, mut client_writer, mut server_reader, mut server_writer, _, _) =
+            vision_direct_pair().await;
+        let mut record = vec![23, 3, 3, 0, 17];
+        record.extend([0xcc; 17]);
+        client_writer.write_all(&record).await.unwrap();
+        let mut received = [0; 1024];
+        timeout(Duration::from_secs(1), async {
+            let mut n = 0;
+            while n < record.len() {
+                let read = server_reader.read_some(&mut received[n..]).await.unwrap();
+                assert_ne!(read, 0);
+                n += read;
+            }
+            assert_eq!(&received[..n], record);
+        })
+        .await
+        .expect("uplink waited for another record");
+
+        server_writer.write_all(&record).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            let mut n = 0;
+            while n < record.len() {
+                let read = client_reader.read_some(&mut received[n..]).await.unwrap();
+                assert_ne!(read, 0);
+                n += read;
+            }
+            assert_eq!(&received[..n], record);
+        })
+        .await
+        .expect("downlink waited for another record");
+    }
+
+    #[tokio::test]
+    async fn vision_direct_clean_half_close_is_eof_only_at_record_boundary() {
+        let (mut client_reader, mut client_writer, mut server_reader, mut server_writer, _, _) =
+            vision_direct_pair().await;
+        client_writer.shutdown().await.unwrap();
+        server_writer.shutdown().await.unwrap();
+        let mut byte = [0];
+        assert_eq!(server_reader.read_some(&mut byte).await.unwrap(), 0);
+        assert_eq!(client_reader.read_some(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn vision_direct_truncated_bodies_are_errors_in_both_directions() {
+        let (mut client_reader, mut client_writer, mut server_reader, mut server_writer, _, _) =
+            vision_direct_pair().await;
+        let truncated = [23, 3, 3, 0, 17, 1, 2, 3];
+        client_writer.write_all(&truncated).await.unwrap();
+        server_writer.write_all(&truncated).await.unwrap();
+        assert!(client_writer.shutdown().await.is_err());
+        assert!(server_writer.shutdown().await.is_err());
+
+        let mut uplink = [0; 22];
+        let mut downlink = [0; 22];
+        let (uplink_result, downlink_result) = tokio::join!(
+            server_reader.read_exact(&mut uplink),
+            client_reader.read_exact(&mut downlink),
+        );
+        assert!(
+            uplink_result
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected EOF in direct TLS record body")
+        );
+        assert!(
+            downlink_result
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected EOF in direct TLS record body")
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_direct_writer_reports_a_buffered_truncated_header() {
+        let (_, mut client_writer, _, _, _, _) = vision_direct_pair().await;
+        client_writer.write_all(&[23, 3]).await.unwrap();
+        assert!(
+            client_writer
+                .shutdown()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected EOF in outgoing direct TLS record")
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_direct_truncated_header_is_not_clean_eof() {
+        let (_, mut client_writer, mut server_reader, _, _, _) = vision_direct_pair().await;
+        client_writer.socket.write_all(&[23, 3]).await.unwrap();
+        client_writer.shutdown().await.unwrap();
+        assert!(server_reader.read_some(&mut [0; 1]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypted_vision_frames_reject_truncated_eof() {
+        let uuid = [0x42; 16];
+        let mut frame = uuid.to_vec();
+        frame.extend_from_slice(&[1, 0, 2, 0, 3, 0xaa, 0xbb, 0, 0, 0]);
+        for length in [1, 15, 16, 20, 21, 22, 23, 25, 26] {
+            let (_, mut client, mut server, _) = pair(Algorithm::Aes).await;
+            server.enable_vision(uuid, SharedState::new()).unwrap();
+            client.write_all(&frame[..length]).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut output = [0; 8];
+            let eof = loop {
+                match server.read_some(&mut output).await {
+                    Ok(0) => break Ok(()),
+                    Ok(_) => {}
+                    Err(error) => break Err(error),
+                }
+            };
+            if length == frame.len() {
+                eof.unwrap();
+            } else {
+                assert!(
+                    eof.unwrap_err()
+                        .to_string()
+                        .contains("unexpected EOF in XTLS Vision frame"),
+                    "accepted {length}-byte prefix"
+                );
+            }
+        }
     }
 
     #[tokio::test]
