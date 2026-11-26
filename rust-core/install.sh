@@ -5,6 +5,7 @@ umask 077
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG='' BINARY='' SNAPSHOT='' COMMITTED=false
 CORE=/usr/local/bin/vless-rust
+IPV4_HELPER=/usr/local/bin/prefer-ipv4
 CONF=/usr/local/etc/vless-rust/config.json
 MANAGER=/usr/local/bin/venc
 UNIT=/etc/systemd/system/vless-rust.service
@@ -28,7 +29,7 @@ command -v systemctl >/dev/null
 for path in /usr/local/bin /usr/local/etc /usr/local/etc/vless-rust /usr/local/etc/vless-rust/nodes /etc/systemd/system; do
     [[ ! -L "$path" && ( ! -e "$path" || -d "$path" ) ]] || { printf 'Invalid install directory: %s\n' "$path" >&2; exit 1; }
 done
-for path in "$CORE" "$CONF" "$UNIT" "$TEMPLATE" "$MANAGER"; do
+for path in "$CORE" "$IPV4_HELPER" "$CONF" "$UNIT" "$TEMPLATE" "$MANAGER"; do
     [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || { printf 'Invalid install target: %s\n' "$path" >&2; exit 1; }
 done
 if [[ -z "$BINARY" ]]; then
@@ -36,7 +37,7 @@ if [[ -z "$BINARY" ]]; then
     cargo build --manifest-path "$ROOT/Cargo.toml" --locked --release
     BINARY="$ROOT/target/release/vless-rust"
 fi
-[[ -x "$BINARY" && "$("$BINARY" version)" == 'vless-rust 0.3.1 reference Xray-core v26.11.9' ]] || { printf 'Expected vless-rust 0.3.1, reference Xray-core v26.11.9.\n' >&2; exit 1; }
+[[ -x "$BINARY" && "$("$BINARY" version)" == 'vless-rust 0.3.2 reference Xray-core v26.11.9' ]] || { printf 'Expected vless-rust 0.3.2, reference Xray-core v26.11.9.\n' >&2; exit 1; }
 if ! getent group vless-rust >/dev/null; then groupadd --system vless-rust; fi
 if ! id vless-rust >/dev/null 2>&1; then useradd --system --gid vless-rust --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin vless-rust; fi
 install -d -m 0750 -o root -g vless-rust /usr/local/etc/vless-rust /usr/local/etc/vless-rust/nodes
@@ -72,7 +73,7 @@ while read -r unit _; do
     esac
 done <<< "$units"
 SNAPSHOT=$(mktemp -d /tmp/vless-rust-rollback.XXXXXX)
-PATHS=("$CORE" "$CONF" "$UNIT" "$TEMPLATE" "$MANAGER")
+PATHS=("$CORE" "$IPV4_HELPER" "$CONF" "$UNIT" "$TEMPLATE" "$MANAGER")
 for i in "${!PATHS[@]}"; do [[ ! -f "${PATHS[i]}" ]] || cp -p -- "${PATHS[i]}" "$SNAPSHOT/$i"; done
 cleanup() {
     local rc=$? i temporary failed=false
@@ -108,6 +109,7 @@ stage_file() {
     mv -Tf -- "$temporary" "$destination"
 }
 stage_file "$BINARY" "$CORE" 0755 root
+stage_file "$ROOT/prefer-ipv4.sh" "$IPV4_HELPER" 0755 root
 stage_file "$ROOT/venc" "$MANAGER" 0755 root
 stage_file "$ROOT/systemd/vless-rust.service" "$UNIT" 0644 root
 stage_file "$ROOT/systemd/vless-rust@.service" "$TEMPLATE" 0644 root
@@ -120,4 +122,4 @@ for unit in "${ACTIVE[@]}"; do
     sleep 3
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] && systemctl is-active --quiet "$unit" && [[ "$pid" == "$(systemctl show --property=MainPID --value "$unit")" ]] || { printf 'Node %s did not stay running.\n' "$unit" >&2; exit 1; }
 done
-printf 'Installed vless-rust 0.3.1 and venc. Existing configurations/enablement retained.\nRun sudo venc to create or manage nodes.\n'
+printf 'Installed vless-rust 0.3.2, venc and prefer-ipv4. Existing node configurations/enablement retained.\nRun sudo venc to create or manage nodes.\n'

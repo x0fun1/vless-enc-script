@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="v26.11.24-rust"
-CORE_VERSION="0.3.1"
+SCRIPT_VERSION="v26.11.26-rust"
+CORE_VERSION="0.3.2"
 CORE_REFERENCE="Xray-core v26.11.9"
 BUILD_ROOT=/usr/local/lib/vless-rust-build
 WORK_DIR=''
@@ -87,8 +87,8 @@ chmod 0755 "$binary"
 archive=$WORK_DIR/deploy.tar.gz
 download_verified vless-rust-deploy.tar.gz "$archive"
 mkdir "$WORK_DIR/deploy"
-tar --no-same-owner -xzf "$archive" -C "$WORK_DIR/deploy" -- install.sh venc systemd/vless-rust.service systemd/vless-rust@.service
-for file in install.sh venc systemd/vless-rust.service systemd/vless-rust@.service; do
+tar --no-same-owner -xzf "$archive" -C "$WORK_DIR/deploy" -- install.sh venc prefer-ipv4.sh systemd/vless-rust.service systemd/vless-rust@.service
+for file in install.sh venc prefer-ipv4.sh systemd/vless-rust.service systemd/vless-rust@.service; do
     [[ -f "$WORK_DIR/deploy/$file" && ! -L "$WORK_DIR/deploy/$file" ]] || fail "Invalid deployment file: $file"
 done
 printf 'Installing core and management menu (no node will be created)...\n'

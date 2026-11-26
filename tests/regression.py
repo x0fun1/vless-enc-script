@@ -13,6 +13,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 MANAGER = ROOT / "rust-core/venc"
+IPV4_HELPER = ROOT / "rust-core/prefer-ipv4.sh"
 BASH = shutil.which("bash") or "bash"
 if os.name == "nt":
     # Git's bin/bash.exe launcher prepends real system commands to PATH,
@@ -37,6 +38,8 @@ state_path = root / "fake-state.json"
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
 def save(): state_path.write_text(json.dumps(state))
 if kind == "id": print("0")
+elif kind == "uname": print("Linux")
+elif kind == "getconf": print("glibc 2.39")
 elif kind in ("chown", "flock"): pass
 elif kind == "install":
     assert "-d" in args, args
@@ -134,12 +137,13 @@ class DeploymentInstallerTests(unittest.TestCase):
         self.assertNotIn('cargo build', source)
         self.assertNotIn('/root/vless-rust_link.txt', source)
         workflow = (ROOT / ".github/workflows/rust-core-release.yml").read_text(encoding="utf-8")
-        for text in ("arch: x86_64", "arch: aarch64", "cargo build --locked --release", "vless-rust-deploy.tar.gz", "systemd/vless-rust@.service"):
+        for text in ("arch: x86_64", "arch: aarch64", "cargo build --locked --release", "vless-rust-deploy.tar.gz", "systemd/vless-rust@.service", "prefer-ipv4.sh"):
             self.assertIn(text, workflow)
+        self.assertIn("prefer-ipv4.sh", source)
         self.assertIn('nodes/%i/config.json', (ROOT / "rust-core/systemd/vless-rust@.service").read_text())
 
     def test_all_install_scripts_parse(self):
-        for path in (INSTALLER, ROOT / "rust-core/install.sh", MANAGER):
+        for path in (INSTALLER, ROOT / "rust-core/install.sh", MANAGER, IPV4_HELPER):
             with self.subTest(path=path):
                 result = subprocess.run([BASH, "-n", str(path)], capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -158,9 +162,13 @@ class ManagerTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(f"#!/usr/bin/env bash\nexec {shlex.quote(sys.executable.replace(chr(92), '/'))} {shlex.quote(fake.as_posix())} {kind} \"$@\"\n", encoding="utf-8", newline="\n")
             path.chmod(0o755)
-        for cmd in ("id", "install", "chown", "flock", "ss", "shuf", "curl", "systemctl"):
+        for cmd in ("id", "uname", "getconf", "install", "chown", "flock", "ss", "shuf", "curl", "systemctl"):
             wrapper(self.mock_bin / cmd, cmd)
         wrapper(self.root / "usr/local/bin/vless-rust", "core")
+        ipv4_helper = self.root / "usr/local/bin/prefer-ipv4"
+        ipv4_helper.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(IPV4_HELPER, ipv4_helper)
+        ipv4_helper.chmod(0o755)
         template = self.root / "etc/systemd/system/vless-rust@.service"
         template.parent.mkdir(parents=True)
         template.write_text("fake unit")
@@ -198,10 +206,31 @@ class ManagerTests(unittest.TestCase):
         result = self.run_menu("1\n0\n0\n")
         self.assertIn("1. 创建节点", result.stdout)
         self.assertIn("10. 更新脚本并迁移旧版节点", result.stdout)
+        self.assertIn("11. 设置 IPv4 优先（保留 IPv6）", result.stdout)
         self.assertIn("Reality + XTLS Vision（实验性，X25519）", result.stdout)
         self.assertIn("Reality + XTLS Vision（实验性，ML-KEM-768）", result.stdout)
         self.assertEqual(self.configs(), {})
         self.assertFalse(self.calls())
+
+    def test_menu_enables_ipv4_preference_and_helper_restores_original_rules(self):
+        config = self.root / "etc/gai.conf"
+        original = "# Existing resolver settings\nprecedence ::1/128 50\nprecedence ::ffff:0:0/96 10\n"
+        config.write_text(original, encoding="utf-8")
+
+        result = self.run_menu("11\n0\n")
+        self.assertIn("已启用 IPv4 优先", result.stdout)
+        enabled = config.read_text(encoding="utf-8")
+        self.assertIn("# prefer-ipv4.sh saved: precedence ::1/128 50", enabled)
+        self.assertIn("# prefer-ipv4.sh saved: precedence ::ffff:0:0/96 10", enabled)
+        self.assertIn("precedence ::ffff:0:0/96 100", enabled)
+
+        self.run_menu("11\n0\n")
+        self.assertEqual(config.read_text(encoding="utf-8"), enabled)
+
+        helper = self.root / "usr/local/bin/prefer-ipv4"
+        restored = subprocess.run([BASH, str(helper), "restore"], capture_output=True, text=True, encoding="utf-8", timeout=15, env=self.env)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(config.read_text(encoding="utf-8"), original)
 
     def test_multiple_nodes_survive_create_show_and_delete(self):
         self.run_menu("1\n1\n18443\n0\n")

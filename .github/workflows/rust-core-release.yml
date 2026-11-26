@@ -102,6 +102,7 @@ jobs:
           sparse-checkout: |
             rust-core/Cargo.toml
             rust-core/venc
+            rust-core/prefer-ipv4.sh
             rust-core/install.sh
             rust-core/systemd/
       - uses: actions/download-artifact@v8
@@ -124,7 +125,7 @@ jobs:
         run: |
           install -m 0755 rust-core/venc dist/venc
           sha256sum dist/venc | awk '{print $1}' > dist/venc.sha256
-          tar -czf dist/vless-rust-deploy.tar.gz -C rust-core install.sh venc systemd/vless-rust.service 'systemd/vless-rust@.service'
+          tar -czf dist/vless-rust-deploy.tar.gz -C rust-core install.sh venc prefer-ipv4.sh systemd/vless-rust.service 'systemd/vless-rust@.service'
           sha256sum dist/vless-rust-deploy.tar.gz | awk '{print $1}' > dist/vless-rust-deploy.tar.gz.sha256
       # gh creates a new release and rejects an existing release for this tag.
       # Assets upload to a draft before publication; published versions stay fixed.

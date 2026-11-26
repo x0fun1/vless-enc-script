@@ -2,7 +2,7 @@
 
 独立 Rust 实现的 VLESS Encryption 核心，协议参照 Xray-core `v26.11.9`。支持 TCP、UDP、Mux、XUDP；另提供**实验性的 XTLS Vision（直连 TCP）**和 **REALITY + VLESS Encryption**，REALITY 可选 ML-DSA-65 证书证明。不启动或嵌入 Go Xray。客户端必须支持 VLESS Encryption 的 `encryption` 参数。
 
-当前工作分支包含 v0.3.1 发布后的安全修复候选，尚未发布；包版本暂仍为 **0.3.1**。下述本轮目标地址策略及代码修复不能视为已经包含在远程安装取得的 v0.3.1 二进制中。
+当前工作分支的待发布版本为 **0.3.2**，包含近期安全修复候选和 IPv4 优先菜单。已发布的 v0.3.1 部署包不包含本轮改动；远程一键安装需要等 v0.3.2 部署包发布后才能取得新菜单。
 
 > 当前公开菜单提供三类节点：普通 Encryption、REALITY + Vision（X25519 Encryption 认证）、REALITY + Vision（ML-KEM-768 Encryption 认证）。后两类均可选择启用额外 ML-DSA-65 证明（默认关闭）。组合已在 Windows localhost 对 Xray-core v26.11.9 完成 30 个官方客户端变体互通，并在 Debian 13 上通过 30 组组合互通及三种 systemd 节点访问 `www.nvidia.com`。ML-DSA-65 另覆盖正确 / 错误验证密钥。Vision 日志只观测到 downlink Direct 转换，uplink Direct 与完整 TLS 指纹等价并未证明。REALITY 仅在已测 TLS 目标形态下复刻 ServerHello / 初始记录特征，不是完整指纹等价、抗探测保证或安全审计。ML-DSA-65 大证书可能导致部分目标的记录长度无法匹配。其他公网目标、长时运行和独立安全审计仍待验证。
 
@@ -14,7 +14,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main/install.sh)
 ```
 
-脚本下载对应架构的预编译核心和同版本部署包，校验 SHA-256，安装核心、服务模板和 `venc`，随后进入菜单。**安装本身不生成节点、UUID、密钥或客户端链接，也不会覆盖已有节点。** 服务器不需要 Rust/Cargo，不进行编译。
+脚本下载对应架构的预编译核心和同版本部署包，校验 SHA-256，安装核心、服务模板、`venc` 和 IPv4 设置脚本，随后进入菜单。**安装本身不生成节点、UUID、密钥或客户端链接，也不会覆盖已有节点。** 服务器不需要 Rust/Cargo，不进行编译。
 
 ```text
 1. 创建节点
@@ -27,12 +27,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main
 8. 查看节点日志
 9. 查看节点状态
 10. 更新脚本并迁移旧版节点
+11. 设置 IPv4 优先（保留 IPv6）
 0. 退出
 ```
 
 - `1`：VLESS + Encryption，无 Reality；回车默认选择此类型。
 - `2`：VLESS + Encryption + Reality + XTLS Vision，X25519 Encryption 认证。
 - `3`：VLESS + Encryption + Reality + XTLS Vision，ML-KEM-768 Encryption 认证。
+
+菜单 **11** 会在使用 glibc 的 Linux 系统中设置 IPv4 优先级，同时保留 IPv6。脚本备份并保留原有 `gai.conf` precedence 规则，也支持通过 `sudo /usr/local/bin/prefer-ipv4 restore` 恢复。
 
 类型 2 / 3 可选择添加 ML-DSA-65 额外证书证明（默认关闭；启用时随机生成 seed，链接中的 `pqv` 公钥由 seed 派生）。TLS 的 REALITY 密钥、short ID、SpiderX 路径均由核心随机生成；公开 `pbk` 是随机生成私钥对应的 X25519 公钥，私钥不会放进链接。
 
@@ -63,7 +66,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main
 - `public-host`：该节点的公网地址，`0600`。
 - `link.txt`：该节点的客户端分享链接，`0600`。
 
-菜单 **3** 可查看指定节点，回车查看全部；链接从当前配置重新生成，不依赖历史终端输出。菜单 **2 / 4 / 6 / 7 / 8 / 9** 只操作所选节点，**5** 才卸载全部节点。选择 **10** 并确认后，会从项目主分支下载最新安装脚本、更新核心和管理菜单，然后自动迁移旧版单节点（如果存在）。
+菜单 **3** 可查看指定节点，回车查看全部；链接从当前配置重新生成，不依赖历史终端输出。菜单 **2 / 4 / 6 / 7 / 8 / 9** 只操作所选节点，**5** 才卸载全部节点，并恢复由本脚本设置的 IPv4 策略。选择 **10** 并确认后，会从项目主分支下载最新安装脚本、更新核心和管理菜单，然后自动迁移旧版单节点（如果存在）。
 
 旧版 `/usr/local/etc/vless-rust/config.json` 节点会显示为 `legacy`，在迁移前继续使用原 `vless-rust.service`、原地址和原凭据；不会被创建新节点覆盖。选择 **10** 更新后，脚本会将旧配置迁入独立节点目录，保留 UUID、端口、Encryption/Reality 凭据及原启停状态，并切换到模板服务。迁移校验或启动失败时会尝试恢复旧服务和配置；若旧节点缺少公网地址，会提示输入以重建分享链接。
 

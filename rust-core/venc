@@ -5,6 +5,7 @@ umask 077
 # VENC_ROOT is useful for isolated regression tests; production defaults to /.
 PREFIX=${VENC_ROOT:-}
 CORE=$PREFIX/usr/local/bin/vless-rust
+IPV4_HELPER=$PREFIX/usr/local/bin/prefer-ipv4
 CONFIG_DIR=$PREFIX/usr/local/etc/vless-rust
 NODES_DIR=$CONFIG_DIR/nodes
 CONFIG=$CONFIG_DIR/config.json
@@ -379,13 +380,18 @@ manage_service() {
         *) systemctl "$action" "$(node_service "$SELECTED")" ;;
     esac
 }
+enable_ipv4_preference() {
+    [[ -x "$IPV4_HELPER" ]] || { fail '缺少 IPv4 优先设置脚本，请重新运行安装脚本。'; return 1; }
+    "$IPV4_HELPER" enable
+}
 uninstall_core() {
     local answer id
-    read -r -p '卸载核心、venc 和全部节点？[y/N] ' answer || return 1
+    read -r -p '卸载核心、venc、IPv4 优先设置和全部节点？[y/N] ' answer || return 1
     [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    if [[ -x "$IPV4_HELPER" ]]; then "$IPV4_HELPER" restore || return 1; fi
     load_nodes
     for id in "${NODE_IDS[@]}"; do systemctl disable --now "$(node_service "$id")" || return 1; done
-    rm -f "$UNIT" "$TEMPLATE" "$CORE" "$PREFIX/usr/local/bin/venc" "$LINK"
+    rm -f "$UNIT" "$TEMPLATE" "$CORE" "$IPV4_HELPER" "$PREFIX/usr/local/bin/venc" "$LINK"
     rm -rf -- "$CONFIG_DIR"
     systemctl daemon-reload || return 1
     printf '已卸载全部节点和核心；保留 vless-rust 系统账户。\n'
@@ -402,8 +408,8 @@ main() {
     while true; do
         printf '\nVLESS+ENC 多节点管理\n'
         printf '1. 创建节点\n2. 删除指定节点\n3. 显示节点信息\n4. 停止指定节点\n5. 卸载核心和全部节点\n'
-        printf '6. 启动指定节点\n7. 重启指定节点\n8. 查看节点日志\n9. 查看节点状态\n10. 更新脚本并迁移旧版节点\n0. 退出\n'
-        read -r -p '请选择 [0-9]: ' choice || return 0
+        printf '6. 启动指定节点\n7. 重启指定节点\n8. 查看节点日志\n9. 查看节点状态\n10. 更新脚本并迁移旧版节点\n11. 设置 IPv4 优先（保留 IPv6）\n0. 退出\n'
+        read -r -p '请选择 [0-11]: ' choice || return 0
         case "$choice" in
             1) create_node || true ;;
             2) delete_node || true ;;
@@ -415,6 +421,7 @@ main() {
             8) manage_service logs || true ;;
             9) manage_service status || true ;;
             10) update_and_migrate || true ;;
+            11) enable_ipv4_preference || true ;;
             0) return 0 ;;
             *) fail '请输入菜单中的选项。' ;;
         esac
