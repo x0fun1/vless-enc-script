@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_VERSION="v26.11.26-rust"
-CORE_VERSION="0.3.2"
+CORE_VERSION="0.3.3"
 CORE_REFERENCE="Xray-core v26.11.9"
 BUILD_ROOT=/usr/local/lib/vless-rust-build
 WORK_DIR=''

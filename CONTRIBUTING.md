@@ -1,6 +1,6 @@
 # 开发与仓库维护
 
-当前包版本仍为 **0.3.1**；本轮安全修复是尚未发布的候选。已发布的 v0.3.1 资产不包含本轮改动，后续发布必须使用新版本和新 tag。实际执行过的检查及平台限制见 [rust-core/VALIDATION.md](rust-core/VALIDATION.md)，不要将历史 Debian / systemd 结果视为候选版本的验证结果。
+当前包版本为 **0.3.3**。实际执行过的检查及平台限制见 [rust-core/VALIDATION.md](rust-core/VALIDATION.md)；历史 Debian / systemd 结果只适用于文中记录的源代码和二进制。
 
 ## 仓库地图
 
@@ -78,7 +78,7 @@ Rust 工具链 Action 的 `cache-workspaces` 指向 `rust-core -> target`，让�
 
 1. 选择尚未使用的新版本，同步 `rust-core/Cargo.toml`、`rust-core/Cargo.lock` 中本包版本、根目录 `install.sh` 的 `CORE_VERSION`、`rust-core/install.sh` 的版本校验与提示，以及相关文档。CLI 版本由 `CARGO_PKG_VERSION` 派生，部署回归会从 Cargo 包版本检查两层安装器是否一致。
 2. 完成本地检查，提交待发布改动，检查 main 上 x86_64 / aarch64 两个构建结果，并按验证缺口补做 Linux 部署和权限检查。
-3. 经维护者授权，在待发布提交上创建并推送匹配的新 tag，例如下一版为 0.3.2 时使用 `vless-rust-v0.3.2`。本轮不创建或推送 tag。tag 触发的两个架构构建都成功且版本校验通过后，发布任务才会运行。
+3. 经维护者授权，在待发布提交上创建并推送匹配的未使用 tag，例如版本 0.3.3 使用 `vless-rust-v0.3.3`。tag 触发的两个架构构建都成功且版本校验通过后，发布任务才会运行。
 4. 核对 release 记录的源码提交、两个架构的二进制、`venc`、部署归档及各自 SHA-256 文件，再检查远程安装入口取得相同新版本。
 
 工作流使用 `gh release create`，已有同 tag release 会报错，不能覆盖既有资产。不要移动已发布 tag 或复用版本；修复已发布版本应再升版。失败后若留下草稿，先核对其源码和资产，由维护者处理后再重试。与资产一起下载的 SHA-256 文件用于完整性核对，不是签名或独立来源认证。

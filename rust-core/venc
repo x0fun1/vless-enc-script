@@ -15,8 +15,23 @@ UNIT=$PREFIX/etc/systemd/system/vless-rust.service
 TEMPLATE=$PREFIX/etc/systemd/system/vless-rust@.service
 NODE_IDS=()
 SELECTED=''
+INPUT_TIMEOUT_SECONDS=${VENC_INPUT_TIMEOUT_SECONDS:-20}
+[[ "$INPUT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || INPUT_TIMEOUT_SECONDS=20
 
 fail() { printf '错误: %s\n' "$*" >&2; }
+read_prompt() {
+    local prompt=$1 variable=$2 status
+    if read -r -t "$INPUT_TIMEOUT_SECONDS" -p "$prompt" "$variable"; then
+        return 0
+    else
+        status=$?
+    fi
+    if ((status > 128)); then
+        fail "${INPUT_TIMEOUT_SECONDS} 秒无输入，venc 已退出并释放管理锁。"
+        exit 0
+    fi
+    return "$status"
+}
 require_root() { [[ "$(id -u)" == 0 ]] || { fail '请使用 sudo venc 或 root 运行。'; return 1; }; }
 node_dir() { if [[ "$1" == legacy ]]; then printf '%s\n' "$CONFIG_DIR"; else printf '%s/%s\n' "$NODES_DIR" "$1"; fi; }
 node_service() { if [[ "$1" == legacy ]]; then printf 'vless-rust\n'; else printf 'vless-rust@%s\n' "$1"; fi; }
@@ -67,7 +82,7 @@ select_node() {
     SELECTED=''
     list_nodes
     ((${#NODE_IDS[@]})) || return 1
-    read -r -p '请选择节点编号 [0 返回]: ' input || return 1
+    read_prompt '请选择节点编号 [0 返回]: ' input || return 1
     [[ "$input" != 0 ]] || return 1
     [[ "$input" =~ ^[0-9]{1,5}$ ]] && ((10#$input >= 1 && 10#$input <= ${#NODE_IDS[@]})) || { fail '无效的节点编号。'; return 1; }
     SELECTED=${NODE_IDS[10#$input - 1]}
@@ -124,7 +139,7 @@ show_node() {
     local input id
     list_nodes
     ((${#NODE_IDS[@]})) || return 0
-    read -r -p '节点编号 [回车显示全部，0 返回]: ' input || return 1
+    read_prompt '节点编号 [回车显示全部，0 返回]: ' input || return 1
     [[ "$input" != 0 ]] || return 0
     if [[ -z "$input" ]]; then
         for id in "${NODE_IDS[@]}"; do show_node_info "$id" || return 1; done
@@ -146,7 +161,7 @@ create_node() {
     [[ -x "$CORE" && -f "$TEMPLATE" ]] || { fail '请先运行安装脚本安装核心及多节点服务模板。'; return 1; }
     capabilities=$("$CORE" capabilities) || { fail '无法读取核心功能列表。'; return 1; }
     printf '\n1. VLESS + Encryption（无 Reality）\n2. VLESS + Encryption + Reality + XTLS Vision（实验性，X25519）\n3. VLESS + Encryption + Reality + XTLS Vision（实验性，ML-KEM-768）\n0. 返回\n'
-    read -r -p '请选择节点类型 [1]: ' type || return 1
+    read_prompt '请选择节点类型 [1]: ' type || return 1
     type=${type:-1}
     case "$type" in
         0) return 0 ;;
@@ -163,7 +178,7 @@ create_node() {
             ;;
         *) fail '无效的节点类型。'; return 1 ;;
     esac
-    read -r -p "TCP 端口 [${VENC_DEFAULT_PORT:-回车随机 10000-60000}]: " input || return 1
+    read_prompt "TCP 端口 [${VENC_DEFAULT_PORT:-回车随机 10000-60000}]: " input || return 1
     port=${input:-${VENC_DEFAULT_PORT:-}}
     if [[ -z "$port" ]]; then port=$(random_port) || return 1; fi
     [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || { fail '端口必须是 1–65535。'; return 1; }
@@ -171,16 +186,16 @@ create_node() {
     port_available "$port" || { fail "端口 $port 已被服务占用或已分配给其他节点（包括已停止节点）。"; return 1; }
     host=$(public_host) || host=''
     if [[ -z "$host" ]]; then
-        read -r -p '无法检测公网 IP，请输入公网 IP/域名: ' host || return 1
+        read_prompt '无法检测公网 IP，请输入公网 IP/域名: ' host || return 1
         [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || { fail '无效的公网地址。'; return 1; }
     fi
     if [[ "$type" == 2 || "$type" == 3 ]]; then
-        read -r -p 'REALITY SNI [www.nvidia.com]: ' name || return 1
+        read_prompt 'REALITY SNI [www.nvidia.com]: ' name || return 1
         name=${name:-www.nvidia.com}
-        read -r -p 'REALITY 目标 HOST:PORT [www.nvidia.com:443]: ' target || return 1
+        read_prompt 'REALITY 目标 HOST:PORT [www.nvidia.com:443]: ' target || return 1
         target=${target:-${VENC_REALITY_TARGET:-www.nvidia.com:443}}
         options+=(--server-name "$name" --target "$target")
-        read -r -p '启用可选 ML-DSA-65 证书证明？[y/N]: ' input || return 1
+        read_prompt '启用可选 ML-DSA-65 证书证明？[y/N]: ' input || return 1
         case "$input" in
             y|Y|yes|YES)
                 [[ "$capabilities" == *reality-mldsa65* ]] || { fail '当前核心不支持 REALITY ML-DSA-65，请先更新核心。'; return 1; }
@@ -244,7 +259,7 @@ migrate_legacy_node() {
     [[ ! -f "$HOST_FILE" ]] || host=$(<"$HOST_FILE")
     if [[ ! "$host" =~ ^[A-Za-z0-9.:-]+$ ]]; then host=$(public_host) || host=''; fi
     if [[ -z "$host" ]]; then
-        read -r -p '请输入旧节点的公网 IP/域名以重建分享链接: ' host || return 1
+        read_prompt '请输入旧节点的公网 IP/域名以重建分享链接: ' host || return 1
     fi
     [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || { fail '无效的公网地址。'; return 1; }
     "$CORE" check --config "$CONFIG" || return 1
@@ -335,7 +350,7 @@ migrate_legacy_node() {
 }
 update_and_migrate() {
     local installer status answer
-    read -r -p '将从 GitHub 下载并运行最新版安装脚本，随后迁移旧版节点。继续？[y/N] ' answer || return 1
+    read_prompt '将从 GitHub 下载并运行最新版安装脚本，随后迁移旧版节点。继续？[y/N] ' answer || return 1
     [[ "$answer" =~ ^[Yy]$ ]] || return 0
     command -v curl >/dev/null 2>&1 || { fail '缺少 curl，无法在线更新。'; return 1; }
     installer=$(mktemp) || return 1
@@ -364,7 +379,7 @@ delete_node() {
     local answer id directory service
     select_node || return 0
     id=$SELECTED; directory=$(node_dir "$id"); service=$(node_service "$id")
-    read -r -p "仅删除节点 $id？[y/N] " answer || return 1
+    read_prompt "仅删除节点 $id？[y/N] " answer || return 1
     [[ "$answer" =~ ^[Yy]$ ]] || return 0
     systemctl disable --now "$service" || return 1
     if [[ "$id" == legacy ]]; then rm -f "$CONFIG" "$LINK"; else rm -rf -- "$directory"; fi
@@ -386,7 +401,7 @@ enable_ipv4_preference() {
 }
 uninstall_core() {
     local answer id
-    read -r -p '卸载核心、venc、IPv4 优先设置和全部节点？[y/N] ' answer || return 1
+    read_prompt '卸载核心、venc、IPv4 优先设置和全部节点？[y/N] ' answer || return 1
     [[ "$answer" =~ ^[Yy]$ ]] || return 0
     if [[ -x "$IPV4_HELPER" ]]; then "$IPV4_HELPER" restore || return 1; fi
     load_nodes
@@ -409,7 +424,7 @@ main() {
         printf '\nVLESS+ENC 多节点管理\n'
         printf '1. 创建节点\n2. 删除指定节点\n3. 显示节点信息\n4. 停止指定节点\n5. 卸载核心和全部节点\n'
         printf '6. 启动指定节点\n7. 重启指定节点\n8. 查看节点日志\n9. 查看节点状态\n10. 更新脚本并迁移旧版节点\n11. 设置 IPv4 优先（保留 IPv6）\n0. 退出\n'
-        read -r -p '请选择 [0-11]: ' choice || return 0
+        read_prompt '请选择 [0-11]: ' choice || return 0
         case "$choice" in
             1) create_node || true ;;
             2) delete_node || true ;;

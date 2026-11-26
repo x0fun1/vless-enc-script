@@ -2,7 +2,7 @@
 
 独立 Rust 实现的 VLESS Encryption 核心，协议参照 Xray-core `v26.11.9`。支持 TCP、UDP、Mux、XUDP；另提供**实验性的 XTLS Vision（直连 TCP）**和 **REALITY + VLESS Encryption**，REALITY 可选 ML-DSA-65 证书证明。不启动或嵌入 Go Xray。客户端必须支持 VLESS Encryption 的 `encryption` 参数。
 
-当前工作分支的待发布版本为 **0.3.2**，包含近期安全修复候选和 IPv4 优先菜单。已发布的 v0.3.1 部署包不包含本轮改动；远程一键安装需要等 v0.3.2 部署包发布后才能取得新菜单。
+当前版本为 **0.3.3**，增加 `venc` 输入超时：交互提示 20 秒没有完成输入时自动退出并释放管理锁。该版本的核心和部署包由 `vless-rust-v0.3.3` release workflow 构建。
 
 > 当前公开菜单提供三类节点：普通 Encryption、REALITY + Vision（X25519 Encryption 认证）、REALITY + Vision（ML-KEM-768 Encryption 认证）。后两类均可选择启用额外 ML-DSA-65 证明（默认关闭）。组合已在 Windows localhost 对 Xray-core v26.11.9 完成 30 个官方客户端变体互通，并在 Debian 13 上通过 30 组组合互通及三种 systemd 节点访问 `www.nvidia.com`。ML-DSA-65 另覆盖正确 / 错误验证密钥。Vision 日志只观测到 downlink Direct 转换，uplink Direct 与完整 TLS 指纹等价并未证明。REALITY 仅在已测 TLS 目标形态下复刻 ServerHello / 初始记录特征，不是完整指纹等价、抗探测保证或安全审计。ML-DSA-65 大证书可能导致部分目标的记录长度无法匹配。其他公网目标、长时运行和独立安全审计仍待验证。
 

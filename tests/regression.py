@@ -212,6 +212,28 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.configs(), {})
         self.assertFalse(self.calls())
 
+    def test_idle_prompt_exits_manager_and_releases_session(self):
+        for inputs in (b"", b"1\n"):
+            with self.subTest(inputs=inputs):
+                process = subprocess.Popen(
+                    [BASH, str(MANAGER)], stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env | {"VENC_INPUT_TIMEOUT_SECONDS": "1"},
+                )
+                try:
+                    if inputs:
+                        process.stdin.write(inputs)
+                        process.stdin.flush()
+                    returncode = process.wait(timeout=5)
+                    stdout, stderr = process.communicate()
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate()
+                self.assertEqual(returncode, 0, stderr.decode("utf-8"))
+                self.assertIn("venc 已退出并释放管理锁", stderr.decode("utf-8"))
+                if inputs:
+                    self.assertIn("VLESS + Encryption", stdout.decode("utf-8"))
+
     def test_menu_enables_ipv4_preference_and_helper_restores_original_rules(self):
         config = self.root / "etc/gai.conf"
         original = "# Existing resolver settings\nprecedence ::1/128 50\nprecedence ::ffff:0:0/96 10\n"

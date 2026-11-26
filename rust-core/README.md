@@ -1,10 +1,10 @@
 # 独立 VLESS Encryption Rust 核心
 
-版本 **0.3.2**。协议参照固定的 **Xray-core v26.11.9**，编译工具链固定为 **Rust 1.100.0**，依赖通过 `Cargo.lock` 锁定。进程自身完成加密握手、记录层和转发，不启动或嵌入 Go Xray。
+版本 **0.3.3**。协议参照固定的 **Xray-core v26.11.9**，编译工具链固定为 **Rust 1.100.0**，依赖通过 `Cargo.lock` 锁定。进程自身完成加密握手、记录层和转发，不启动或嵌入 Go Xray。
 
-当前功能均以 opt-in 方式启用；v0.3.1 已发布，v0.3.2 尚未发布。本项目尚未经过独立安全审计。普通 Encryption 基线和后续实验功能的验证范围分别记录于 [VALIDATION.md](VALIDATION.md)。Debian 13 上的 v0.3.1 systemd 三节点及 NVIDIA target smoke 已完成；临时节点已删除并恢复原 0.2.0 安装。长时间运行、移动网络、其他公网目标和完整 fingerprint parity 尚未验证；off-host 入站测试未做。
+当前功能均以 opt-in 方式启用；v0.3.3 增加管理器输入超时：交互提示在 20 秒内没有完成输入时自动退出并释放会话锁。本项目尚未经过独立安全审计。普通 Encryption 基线和后续实验功能的验证范围分别记录于 [VALIDATION.md](VALIDATION.md)。Debian 13 上的 v0.3.1 systemd 三节点及 NVIDIA target smoke 已完成；临时节点已删除并恢复原 0.2.0 安装。长时间运行、移动网络、其他公网目标和完整 fingerprint parity 尚未验证；off-host 入站测试未做。
 
-当前工作分支包含发布后的安全修复候选和 IPv4 优先菜单，包版本为 0.3.2，尚未发布。本轮候选的变更与检查结果单独记录于验证文档；2026-11-24 的 Debian 13 / systemd 结果只覆盖已发布基线。
+v0.3.3 在此前安全修复和 IPv4 优先菜单基础上增加管理器空闲退出。本轮变更与检查结果单独记录于验证文档；2026-11-24 的 Debian 13 / systemd 结果只覆盖当时的已验证基线。
 
 ## 已支持的范围
 
@@ -103,6 +103,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/x0fun1/vless-enc-script/main
 
 菜单类型 1 是普通 Encryption；类型 2 / 3 分别为 REALITY + Vision 的 X25519 / ML-KEM-768 Encryption 认证，ML-DSA-65 可在创建时额外选择开启（默认关闭）。 SNI / 目标默认 `www.nvidia.com` / `www.nvidia.com:443`，可以分别自定义。公网地址自动检测，UUID 和密钥自动生成。创建第二个节点不会更改第一个节点。可直接运行 `sudo venc` 管理：1 创建、2 删除指定节点、3 显示指定或全部节点、4 停止指定节点、5 卸载全部、6 启动、7 重启、8 日志、9 状态、10 更新脚本并迁移旧节点、11 设置 IPv4 优先（保留 IPv6）、0 退出。选择 10 后需确认；它会执行最新版安装器，更新核心和菜单，并自动迁移旧版单节点（若存在）。
 
+菜单及其他交互提示在 20 秒内没有完成输入时会自动退出，释放管理锁。可用 `VENC_INPUT_TIMEOUT_SECONDS` 调整等待秒数；只接受正整数，其他值回退到 20 秒。
+
 菜单 11 在 glibc Linux 上更新 `gai.conf`，为 IPv4 设置较高的地址选择优先级。它备份并保留原有 precedence 规则，IPv6 仍可用。运行 `sudo /usr/local/bin/prefer-ipv4 restore` 可撤销该策略。
 
 - 新节点目录：`/usr/local/etc/vless-rust/nodes/node-<32位UUID>/`。
@@ -126,7 +128,7 @@ journalctl -u vless-rust@node-<ID> -f --no-pager
 systemctl restart vless-rust@node-<ID>
 ```
 
-不能与其他服务在相同监听地址和端口同时运行。安装不负责停止原 Xray；更新正在运行的节点会短暂中断已有连接。必须发布 `vless-rust-v0.3.2` 下的二进制、部署包及其 SHA-256 文件后，远程一键入口才能取得本版本。
+不能与其他服务在相同监听地址和端口同时运行。安装不负责停止原 Xray；更新正在运行的节点会短暂中断已有连接。远程一键入口通过 `vless-rust-v0.3.3` release 中的二进制、部署包及 SHA-256 文件取得本版本。
 
 ## 从现有普通节点迁移
 

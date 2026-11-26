@@ -37,7 +37,7 @@ if [[ -z "$BINARY" ]]; then
     cargo build --manifest-path "$ROOT/Cargo.toml" --locked --release
     BINARY="$ROOT/target/release/vless-rust"
 fi
-[[ -x "$BINARY" && "$("$BINARY" version)" == 'vless-rust 0.3.2 reference Xray-core v26.11.9' ]] || { printf 'Expected vless-rust 0.3.2, reference Xray-core v26.11.9.\n' >&2; exit 1; }
+[[ -x "$BINARY" && "$("$BINARY" version)" == 'vless-rust 0.3.3 reference Xray-core v26.11.9' ]] || { printf 'Expected vless-rust 0.3.3, reference Xray-core v26.11.9.\n' >&2; exit 1; }
 if ! getent group vless-rust >/dev/null; then groupadd --system vless-rust; fi
 if ! id vless-rust >/dev/null 2>&1; then useradd --system --gid vless-rust --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin vless-rust; fi
 install -d -m 0750 -o root -g vless-rust /usr/local/etc/vless-rust /usr/local/etc/vless-rust/nodes
@@ -122,4 +122,4 @@ for unit in "${ACTIVE[@]}"; do
     sleep 3
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] && systemctl is-active --quiet "$unit" && [[ "$pid" == "$(systemctl show --property=MainPID --value "$unit")" ]] || { printf 'Node %s did not stay running.\n' "$unit" >&2; exit 1; }
 done
-printf 'Installed vless-rust 0.3.2, venc and prefer-ipv4. Existing node configurations/enablement retained.\nRun sudo venc to create or manage nodes.\n'
+printf 'Installed vless-rust 0.3.3, venc and prefer-ipv4. Existing node configurations/enablement retained.\nRun sudo venc to create or manage nodes.\n'
