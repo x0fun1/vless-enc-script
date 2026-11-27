@@ -67,8 +67,9 @@ elif kind == "systemctl":
         state["enabled:" + unit] = "disabled-runtime" if "--runtime" in args else "disabled"
         if "--now" in args: state[unit] = "inactive"
         save()
-    elif command in ("stop", "start", "restart"):
-        state[unit] = "inactive" if command == "stop" else "active"; save()
+    elif command in ("stop", "start", "restart", "try-restart"):
+        if command != "try-restart" or state.get(unit) == "active":
+            state[unit] = "inactive" if command == "stop" else "active"; save()
     elif command == "is-active":
         active = state.get(unit) == "active"
         if "--quiet" not in args: print("active" if active else "inactive")
@@ -205,12 +206,39 @@ class ManagerTests(unittest.TestCase):
     def test_opening_menu_does_not_create_node(self):
         result = self.run_menu("1\n0\n0\n")
         self.assertIn("1. 创建节点", result.stdout)
+        self.assertIn("7. 重启核心（所有运行中的节点）", result.stdout)
         self.assertIn("10. 更新脚本并迁移旧版节点", result.stdout)
         self.assertIn("11. 设置 IPv4 优先（保留 IPv6）", result.stdout)
         self.assertIn("Reality + XTLS Vision（实验性，X25519）", result.stdout)
         self.assertIn("Reality + XTLS Vision（实验性，ML-KEM-768）", result.stdout)
         self.assertEqual(self.configs(), {})
         self.assertFalse(self.calls())
+
+    def test_restart_core_includes_legacy_and_skips_stopped_nodes(self):
+        self.run_menu("1\n1\n18443\n1\n1\n18444\n4\n2\n0\n")
+        nodes = sorted(self.configs())
+        self.assertEqual(len(nodes), 2)
+        running_service = "vless-rust@" + nodes[0]
+        stopped_service = "vless-rust@" + nodes[1]
+        (self.nodes.parent / "config.json").write_text("{}", encoding="utf-8")
+        state_path = self.root / "fake-state.json"
+        state = json.loads(state_path.read_text())
+        state["vless-rust"] = "active"
+        state_path.write_text(json.dumps(state))
+        result = self.run_menu("7\ny\n0\n")
+        restarts = [call[-1] for call in self.calls() if call[0] in ("restart", "try-restart")]
+        self.assertCountEqual(restarts, ["vless-rust", running_service])
+        self.assertIn(running_service, result.stdout)
+        self.assertNotIn(stopped_service, result.stdout)
+        self.assertEqual(json.loads(state_path.read_text())[stopped_service], "inactive")
+
+    def test_restart_core_cancel_does_not_restart_nodes(self):
+        self.run_menu("1\n1\n18443\n0\n")
+        self.run_menu("7\nn\n0\n")
+        self.assertFalse(any(call[0] in ("restart", "try-restart") for call in self.calls()))
+        state = json.loads((self.root / "fake-state.json").read_text())
+        node = next(iter(self.configs()))
+        self.assertEqual(state["vless-rust@" + node], "active")
 
     def test_idle_prompt_exits_manager_and_releases_session(self):
         for inputs in (b"", b"1\n"):

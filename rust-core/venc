@@ -395,6 +395,30 @@ manage_service() {
         *) systemctl "$action" "$(node_service "$SELECTED")" ;;
     esac
 }
+restart_core() {
+    local answer id service failed=0
+    local -a active_services=()
+    load_nodes
+    for id in "${NODE_IDS[@]}"; do
+        service=$(node_service "$id")
+        if systemctl is-active --quiet "$service"; then
+            active_services+=("$service")
+        fi
+    done
+    ((${#active_services[@]})) || { printf '当前没有运行中的节点可重启。\n'; return 0; }
+    printf '以下运行中的节点将重启：\n'
+    printf '  %s\n' "${active_services[@]}"
+    read_prompt '重启核心会中断以上节点的现有连接，继续？[y/N] ' answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    for service in "${active_services[@]}"; do
+        if ! systemctl try-restart "$service"; then
+            fail "重启 $service 失败。"
+            failed=1
+        fi
+    done
+    ((failed == 0)) || return 1
+    printf '核心重启操作已完成。\n'
+}
 enable_ipv4_preference() {
     [[ -x "$IPV4_HELPER" ]] || { fail '缺少 IPv4 优先设置脚本，请重新运行安装脚本。'; return 1; }
     "$IPV4_HELPER" enable
@@ -423,7 +447,7 @@ main() {
     while true; do
         printf '\nVLESS+ENC 多节点管理\n'
         printf '1. 创建节点\n2. 删除指定节点\n3. 显示节点信息\n4. 停止指定节点\n5. 卸载核心和全部节点\n'
-        printf '6. 启动指定节点\n7. 重启指定节点\n8. 查看节点日志\n9. 查看节点状态\n10. 更新脚本并迁移旧版节点\n11. 设置 IPv4 优先（保留 IPv6）\n0. 退出\n'
+        printf '6. 启动指定节点\n7. 重启核心（所有运行中的节点）\n8. 查看节点日志\n9. 查看节点状态\n10. 更新脚本并迁移旧版节点\n11. 设置 IPv4 优先（保留 IPv6）\n0. 退出\n'
         read_prompt '请选择 [0-11]: ' choice || return 0
         case "$choice" in
             1) create_node || true ;;
@@ -432,7 +456,7 @@ main() {
             4) manage_service stop || true ;;
             5) uninstall_core || true ;;
             6) manage_service start || true ;;
-            7) manage_service restart || true ;;
+            7) restart_core || true ;;
             8) manage_service logs || true ;;
             9) manage_service status || true ;;
             10) update_and_migrate || true ;;
